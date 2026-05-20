@@ -1,0 +1,78 @@
+[package]
+name = "ruproxy"
+version = "0.1.0"
+edition = "2021"
+description = "A multi-protocol proxy server (Hysteria2 + VLESS + Reality) in Rust"
+license = "MIT"
+
+[[bin]]
+name = "ruproxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# QUIC (Hysteria2)
+quinn = "0.11"
+quinn-proto = "0.11"
+
+# HTTP/3 (Hysteria2 auth uses H3)
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+
+# Self-signed certificate generation
+rcgen = "0.13"
+
+# WebSocket (VLESS ws transport)
+tokio-tungstenite = "=0.20.1"
+futures-util = "0.3"
+
+# UUID (VLESS auth)
+uuid = { version = "1", features = ["v4"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Byte utilities
+bytes = "1"
+
+# Random number generation
+rand = "0.8"
+
+# HTTP (masquerade reverse proxy)
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client", "client-legacy"] }
+http-body-util = "0.1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Reality transport dependencies
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+base64 = "0.22"        # decode x25519 keys from config
+hex = "0.4"            # decode Reality short IDs from config
+libc = "0.2"           # MSG_PEEK for TLS ClientHello inspection
+
+ring = "0.17"          # rustls crypto provider (main.rs: ring::default_provider)
+
+# Reality crypto (新增，ring 本身没有 AES-GCM / HKDF 的便捷接口)
+aes-gcm = "0.10"           # AES-256-GCM for Session ID decryption
+chacha20poly1305 = "0.10"  # ChaCha20-Poly1305 for Session ID decryption
+hkdf = "0.12"              # HKDF for auth_key derivation
+hmac = "0.12"              # HMAC-SHA512 for Reality certificate Signature
+sha2 = "0.10"              # SHA-256/SHA-512 for HKDF and HMAC
+
+[profile.release]
