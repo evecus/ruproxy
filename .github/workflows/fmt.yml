@@ -1,4 +1,4 @@
-name: Auto Format
+name: Format-All
 
 on:
   workflow_dispatch:
