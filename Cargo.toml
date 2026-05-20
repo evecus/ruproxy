@@ -33,8 +33,14 @@ rcgen = "0.13"
 tokio-tungstenite = "=0.20.1"
 futures-util = "0.3"
 
-# UUID (VLESS auth)
-uuid = { version = "1", features = ["v4"] }
+# UUID (VLESS auth + TUIC user auth)
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# TUIC: humantime for duration parsing in config
+humantime-serde = "1"
+
+# TUIC: socket2 for UDP socket creation
+socket2 = "0.5"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -74,5 +80,6 @@ chacha20poly1305 = "0.10"  # ChaCha20-Poly1305 for Session ID decryption
 hkdf = "0.12"              # HKDF for auth_key derivation
 hmac = "0.12"              # HMAC-SHA512 for Reality certificate Signature
 sha2 = "0.10"              # SHA-256/SHA-512 for HKDF and HMAC
+crc32fast = "1"            # VMess auth_id CRC32 verification
 
 [profile.release]
