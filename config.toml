@@ -123,3 +123,40 @@ password = "your-strong-password-here"
 cert_path = "/etc/ssl/certs/server.crt"
 key_path  = "/etc/ssl/private/server.key"
 # self_signed_domain = "example.com"
+
+# Shadowsocks + 纯 TCP
+[shadowsocks]
+listen   = "0.0.0.0:8388"
+password = "my-secret"
+method   = "aes-256-gcm"
+
+# Shadowsocks + WebSocket + TLS
+[shadowsocks]
+listen   = "0.0.0.0:443"
+password = "my-secret"
+method   = "chacha20-ietf-poly1305"
+[shadowsocks.transport]
+type    = "ws"
+ws_path = "/shadow"
+[shadowsocks.tls]
+cert_path = "/etc/certs/tls.crt"
+key_path  = "/etc/certs/tls.key"
+
+# VLESS + XHTTP（无 TLS）
+[vless]
+listen = "0.0.0.0:8080"
+uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+[vless.transport]
+type       = "xhttp"
+xhttp_path = "/api"
+
+# VMess + XHTTP + TLS
+[vmess]
+listen = "0.0.0.0:443"
+uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+[vmess.transport]
+type       = "xhttp"
+xhttp_path = "/stream"
+[vmess.tls]
+cert_path = "/etc/certs/tls.crt"
+key_path  = "/etc/certs/tls.key"
