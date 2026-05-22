@@ -325,26 +325,23 @@ impl AsyncRead for XhttpStream {
 impl AsyncWrite for XhttpStream {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        match this.down_tx.poll_reserve(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "xhttp downlink channel closed",
-            ))),
-            Poll::Ready(Ok(())) => {
-                let data = bytes::Bytes::copy_from_slice(buf);
-                match this.down_tx.send_item(data) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(_) => Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "xhttp send_item failed",
-                    ))),
-                }
+        let data = bytes::Bytes::copy_from_slice(buf);
+        match this.down_tx.try_send(data) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — caller should retry; wake immediately so
+                // the executor re-polls us (busy-wait is acceptable here
+                // since the channel drains as hyper reads frames).
+                _cx.waker().wake_by_ref();
+                Poll::Pending
             }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "xhttp downlink closed"),
+            )),
         }
     }
 
