@@ -170,10 +170,8 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
     pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> Result<()> {
         let mut written = 0;
         while written < dst.len() {
-            if self.buf.is_empty() {
-                if !self.fill_buf().await? {
-                    bail!("shadowsocks: unexpected EOF reading address");
-                }
+            if self.buf.is_empty() && !self.fill_buf().await? {
+                bail!("shadowsocks: unexpected EOF reading address");
             }
             let n = self.buf.len().min(dst.len() - written);
             dst[written..written + n].copy_from_slice(&self.buf[..n]);
@@ -185,10 +183,8 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
 
     /// Read up to `dst.len()` plaintext bytes. Returns bytes read (0 = EOF).
     pub async fn read_plain(&mut self, dst: &mut [u8]) -> Result<usize> {
-        if self.buf.is_empty() {
-            if !self.fill_buf().await? {
-                return Ok(0);
-            }
+        if self.buf.is_empty() && !self.fill_buf().await? {
+            return Ok(0);
         }
         let n = self.buf.len().min(dst.len());
         dst[..n].copy_from_slice(&self.buf[..n]);
