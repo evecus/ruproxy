@@ -245,7 +245,6 @@ impl ShadowsocksCipher {
     pub fn tag_len(&self) -> usize {
         16
     }
-    /// Nonce length in bytes.
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
