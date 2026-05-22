@@ -148,8 +148,6 @@ impl Default for TransportConfig {
     }
 }
 
-/// Back-compat alias so old code using `VlessTransportConfig` still compiles.
-pub type VlessTransportConfig = TransportConfig;
 
 // ── TLS layer ─────────────────────────────────────────────────────────────────
 
@@ -248,9 +246,6 @@ impl ShadowsocksCipher {
         16
     }
     /// Nonce length in bytes.
-    pub fn nonce_len(&self) -> usize {
-        12 // all three are 12-byte nonces
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
