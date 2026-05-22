@@ -84,7 +84,7 @@ hkdf = "0.12"              # HKDF (Reality auth_key + Shadowsocks ss-subkey)
 hmac = "0.12"              # HMAC-SHA512 for Reality certificate Signature
 sha2 = "0.10"              # SHA-256/SHA-512 for HKDF and HMAC
 sha1 = "0.10"              # SHA-1 for Shadowsocks HKDF-SHA1 subkey derivation
-md5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
+md-5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
 crc32fast = "1"            # VMess auth_id CRC32 verification
 
 [profile.release]
