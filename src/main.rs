@@ -1,6 +1,7 @@
 mod common;
 mod config;
 mod hysteria2;
+mod shadowsocks;
 mod trojan;
 mod tuic;
 mod vless;
@@ -41,9 +42,10 @@ async fn main() -> Result<()> {
         && cfg.tuic.is_none()
         && cfg.trojan.is_none()
         && cfg.vmess.is_none()
+        && cfg.shadowsocks.is_none()
     {
         anyhow::bail!(
-            "no protocols configured — add a [hysteria2], [vless], or [tuic] section to your config"
+            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], or [shadowsocks] section"
         );
     }
 
@@ -106,6 +108,23 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
+    // ── Shadowsocks server ────────────────────────────────────────────────────
+    if let Some(ss_cfg) = cfg.shadowsocks.clone() {
+        let ss_cfg = Arc::new(ss_cfg);
+        info!(
+            "[shadowsocks] enabled, listen: {}, method={:?}, transport={}",
+            ss_cfg.listen,
+            ss_cfg.method,
+            ss_cfg.transport.r#type,
+        );
+        let h = tokio::spawn(async move {
+            if let Err(e) = shadowsocks::server::run(ss_cfg).await {
+                tracing::error!("[shadowsocks] server exited with error: {e:#}");
+            }
+        });
+        handles.push(h);
+    }
+
     // ── TUIC server ───────────────────────────────────────────────────────────
     if let Some(tuic_cfg) = cfg.tuic.clone() {
         let tuic_cfg = Arc::new(tuic_cfg);
@@ -132,7 +151,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse `-c <path>` from argv, defaulting to "config.toml".
 fn parse_config_arg() -> String {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;

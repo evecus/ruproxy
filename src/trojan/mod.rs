@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
+use crate::common::transport::xhttp::{self, XhttpConfig};
 use crate::config::TrojanConfig;
 
 pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
@@ -24,7 +25,11 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
     };
     let addr: SocketAddr = cfg.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;
-    info!("[trojan] Listening on {addr}");
+    info!(
+        "[trojan] Listening on {addr} (transport={}, tls={})",
+        cfg.transport.r#type,
+        if tls_acceptor.is_some() { "yes" } else { "no" },
+    );
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = cfg.clone();
@@ -43,30 +48,40 @@ async fn handle(
     cfg: &TrojanConfig,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
 ) -> Result<()> {
-    let mut io: Box<dyn AsyncReadWrite> = match (cfg.transport.r#type.as_str(), tls_acceptor) {
+    let transport = cfg.transport.r#type.as_str();
+    let ws_path = cfg.transport.ws_path.as_str();
+    let ws_host = cfg.transport.ws_host.as_deref();
+    let xhttp_path = cfg.transport.xhttp_path.as_str();
+    let xhttp_host = cfg.transport.xhttp_host.clone();
+
+    let mut io: Box<dyn AsyncReadWrite> = match (transport, tls_acceptor) {
         ("tcp", None) => Box::new(stream),
         ("tcp", Some(acc)) => Box::new(acc.accept(stream).await?),
         ("ws", None) => Box::new(
-            shared_ws::accept_plain(
-                stream,
-                &cfg.transport.ws_path,
-                cfg.transport.ws_host.as_deref(),
-            )
-            .await?,
+            shared_ws::accept_plain(stream, ws_path, ws_host).await?,
         ),
         ("ws", Some(acc)) => {
             let tls = acc.accept(stream).await?;
-            Box::new(
-                shared_ws::accept_tls(
-                    tls,
-                    &cfg.transport.ws_path,
-                    cfg.transport.ws_host.as_deref(),
-                )
-                .await?,
-            )
+            Box::new(shared_ws::accept_tls(tls, ws_path, ws_host).await?)
         }
-        _ => bail!("unknown transport"),
+        ("xhttp", None) => {
+            let xh_cfg = XhttpConfig {
+                path: xhttp_path.to_string(),
+                host: xhttp_host,
+            };
+            Box::new(xhttp::accept_plain(stream, peer, &xh_cfg).await?)
+        }
+        ("xhttp", Some(acc)) => {
+            let tls = acc.accept(stream).await?;
+            let xh_cfg = XhttpConfig {
+                path: xhttp_path.to_string(),
+                host: xhttp_host,
+            };
+            Box::new(xhttp::accept_tls(tls, peer, &xh_cfg).await?)
+        }
+        _ => bail!("trojan: unknown transport"),
     };
+
     let target = decode_trojan(&mut io, &cfg.password).await?;
     info!("[trojan] {peer} -> {target}");
     let outbound = TcpStream::connect(&target).await?;

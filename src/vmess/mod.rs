@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
+use crate::common::transport::xhttp::{self, XhttpConfig};
 use crate::config::VmessConfig;
 use crate::vless::protocol::parse_uuid;
 
@@ -97,6 +98,21 @@ async fn handle(
                 )
                 .await?,
             )
+        }
+        ("xhttp", None) => {
+            let xh_cfg = XhttpConfig {
+                path: cfg.transport.xhttp_path.clone(),
+                host: cfg.transport.xhttp_host.clone(),
+            };
+            Box::new(xhttp::accept_plain(stream, peer, &xh_cfg).await?)
+        }
+        ("xhttp", Some(a)) => {
+            let tls = a.accept(stream).await?;
+            let xh_cfg = XhttpConfig {
+                path: cfg.transport.xhttp_path.clone(),
+                host: cfg.transport.xhttp_host.clone(),
+            };
+            Box::new(xhttp::accept_tls(tls, peer, &xh_cfg).await?)
         }
         _ => bail!("bad transport"),
     };

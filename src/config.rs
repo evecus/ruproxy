@@ -16,6 +16,7 @@ pub struct Config {
     pub tuic: Option<TuicConfig>,
     pub trojan: Option<TrojanConfig>,
     pub vmess: Option<VmessConfig>,
+    pub shadowsocks: Option<ShadowsocksConfig>,
 }
 
 // ── TUIC ──────────────────────────────────────────────────────────────────────
@@ -114,28 +115,13 @@ pub struct MasqueradeProxy {
     pub rewrite_host: bool,
 }
 
-// ── VLESS ─────────────────────────────────────────────────────────────────────
+// ── Shared Transport config (reused by VLESS, VMess, Trojan, Shadowsocks) ────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VlessConfig {
-    /// TCP listen address, e.g. "0.0.0.0:8443"
-    pub listen: String,
-    /// UUID for authentication
-    pub uuid: String,
-    /// Transport layer (tcp / ws). Omit entirely to use plain TCP.
-    #[serde(default)]
-    pub transport: VlessTransportConfig,
-    /// TLS layer (tls / reality). Omit entirely for plaintext.
-    pub tls: Option<VlessTlsConfig>,
-}
-
-// ── Transport layer ───────────────────────────────────────────────────────────
-
-/// Controls how raw bytes are carried: plain TCP or WebSocket framing.
+/// Controls how raw bytes are carried: plain TCP, WebSocket, or XHTTP.
 /// This is independent of whether TLS is used.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VlessTransportConfig {
-    /// "tcp" (default) or "ws"
+pub struct TransportConfig {
+    /// "tcp" (default), "ws", or "xhttp"
     #[serde(default = "default_transport_type")]
     pub r#type: String,
 
@@ -143,21 +129,31 @@ pub struct VlessTransportConfig {
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
     pub ws_host: Option<String>,
+
+    // ── XHTTP fields (type = "xhttp" only) ───────────────────────────────
+    #[serde(default = "default_xhttp_path")]
+    pub xhttp_path: String,
+    pub xhttp_host: Option<String>,
 }
 
-impl Default for VlessTransportConfig {
+impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             r#type: default_transport_type(),
             ws_path: default_ws_path(),
             ws_host: None,
+            xhttp_path: default_xhttp_path(),
+            xhttp_host: None,
         }
     }
 }
 
+/// Back-compat alias so old code using `VlessTransportConfig` still compiles.
+pub type VlessTransportConfig = TransportConfig;
+
 // ── TLS layer ─────────────────────────────────────────────────────────────────
 
-/// Controls the TLS layer. Absence of this field means plaintext.
+/// Controls the TLS layer for VLESS. Absence of this field means plaintext.
 ///
 /// Two mutually exclusive variants:
 ///   [vless.tls]  type = "tls"     → standard TLS with cert + key
@@ -172,35 +168,29 @@ pub enum VlessTlsConfig {
         standard: StandardTlsConfig,
     },
     /// Reality: TLS-camouflage transport.
-    /// Clients authenticate via a short ID instead of a CA chain,
-    /// so no certificate file is required.
     Reality(RealityConfig),
 }
 
 // ── Reality config ────────────────────────────────────────────────────────────
 
-/// Reality protocol configuration.
-///
-/// Reality is a TLS-camouflage transport where the server impersonates a real
-/// TLS destination. Clients authenticate via a short ID instead of a CA chain,
-/// so no certificate file is required.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityConfig {
-    /// x25519 private key (base64-encoded, 32 bytes).
     pub private_key: String,
-
-    /// Corresponding x25519 public key (base64). Shared with clients.
     pub public_key: String,
-
-    /// One or more short IDs (hex strings, 0-16 hex chars / 0-8 bytes).
-    /// Clients must present a matching short ID in the ClientHello.
     pub short_ids: Vec<String>,
-
-    /// Destination (host:port) whose TLS fingerprint to impersonate.
     pub dest: String,
-
-    /// SNI the server expects from Reality clients.
     pub server_name: String,
+}
+
+// ── VLESS ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VlessConfig {
+    pub listen: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub transport: TransportConfig,
+    pub tls: Option<VlessTlsConfig>,
 }
 
 // ── Trojan ───────────────────────────────────────────────────────────────────
@@ -210,7 +200,7 @@ pub struct TrojanConfig {
     pub listen: String,
     pub password: String,
     #[serde(default)]
-    pub transport: VlessTransportConfig,
+    pub transport: TransportConfig,
     pub tls: Option<StandardTlsConfig>,
 }
 
@@ -221,8 +211,66 @@ pub struct VmessConfig {
     pub listen: String,
     pub uuid: String,
     #[serde(default)]
-    pub transport: VlessTransportConfig,
+    pub transport: TransportConfig,
     pub tls: Option<StandardTlsConfig>,
+}
+
+// ── Shadowsocks ───────────────────────────────────────────────────────────────
+
+/// Supported Shadowsocks cipher methods (AEAD only; older stream ciphers are
+/// intentionally omitted — they are broken and not used in modern deployments).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadowsocksCipher {
+    /// AEAD_AES_128_GCM
+    Aes128Gcm,
+    /// AEAD_AES_256_GCM
+    Aes256Gcm,
+    /// AEAD_CHACHA20_POLY1305
+    Chacha20IetfPoly1305,
+}
+
+impl ShadowsocksCipher {
+    /// Key length in bytes for each cipher.
+    pub fn key_len(&self) -> usize {
+        match self {
+            ShadowsocksCipher::Aes128Gcm => 16,
+            ShadowsocksCipher::Aes256Gcm => 32,
+            ShadowsocksCipher::Chacha20IetfPoly1305 => 32,
+        }
+    }
+    /// Salt length (= key length for AEAD ciphers).
+    pub fn salt_len(&self) -> usize {
+        self.key_len()
+    }
+    /// AEAD tag length (always 16 for the supported ciphers).
+    pub fn tag_len(&self) -> usize {
+        16
+    }
+    /// Nonce length in bytes.
+    pub fn nonce_len(&self) -> usize {
+        12 // all three are 12-byte nonces
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShadowsocksConfig {
+    /// TCP listen address, e.g. "0.0.0.0:8388"
+    pub listen: String,
+    /// Pre-shared password
+    pub password: String,
+    /// AEAD cipher method (default: aes-256-gcm)
+    #[serde(default = "default_ss_cipher")]
+    pub method: ShadowsocksCipher,
+    /// Transport layer (tcp / ws / xhttp). Omit for plain TCP.
+    #[serde(default)]
+    pub transport: TransportConfig,
+    /// Optional TLS. Use [shadowsocks.tls] in config.toml.
+    pub tls: Option<StandardTlsConfig>,
+}
+
+fn default_ss_cipher() -> ShadowsocksCipher {
+    ShadowsocksCipher::Aes256Gcm
 }
 
 // ── Shared ────────────────────────────────────────────────────────────────────
@@ -275,6 +323,9 @@ fn default_transport_type() -> String {
     "tcp".to_string()
 }
 fn default_ws_path() -> String {
+    "/".to_string()
+}
+fn default_xhttp_path() -> String {
     "/".to_string()
 }
 

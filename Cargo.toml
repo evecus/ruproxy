@@ -52,10 +52,13 @@ bytes = "1"
 # Random number generation
 rand = "0.8"
 
-# HTTP (masquerade reverse proxy)
+# Shadowsocks AEAD (sha1/md5 moved to Reality crypto block below)
+
+# Hyper HTTP server (used by XHTTP/splithttp transport)
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client", "client-legacy"] }
 http-body-util = "0.1"
+http-body = "1"
 
 # Error handling
 anyhow = "1"
@@ -75,11 +78,13 @@ libc = "0.2"           # MSG_PEEK for TLS ClientHello inspection
 ring = "0.17"          # rustls crypto provider (main.rs: ring::default_provider)
 
 # Reality crypto (新增，ring 本身没有 AES-GCM / HKDF 的便捷接口)
-aes-gcm = "0.10"           # AES-256-GCM for Session ID decryption
-chacha20poly1305 = "0.10"  # ChaCha20-Poly1305 for Session ID decryption
-hkdf = "0.12"              # HKDF for auth_key derivation
+aes-gcm = "0.10"           # AES-128/256-GCM (Reality + Shadowsocks AEAD)
+chacha20poly1305 = "0.10"  # ChaCha20-Poly1305 (Reality + Shadowsocks AEAD)
+hkdf = "0.12"              # HKDF (Reality auth_key + Shadowsocks ss-subkey)
 hmac = "0.12"              # HMAC-SHA512 for Reality certificate Signature
 sha2 = "0.10"              # SHA-256/SHA-512 for HKDF and HMAC
+sha1 = "0.10"              # SHA-1 for Shadowsocks HKDF-SHA1 subkey derivation
+md5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
 crc32fast = "1"            # VMess auth_id CRC32 verification
 
 [profile.release]
