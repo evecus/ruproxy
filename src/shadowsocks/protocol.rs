@@ -15,10 +15,6 @@
 //! [NB]  address   4 / (1+N) / 16 bytes
 //! [2B]  port      big-endian u16
 //! ```
-//!
-//! References:
-//! - https://shadowsocks.org/doc/aead.html
-//! - Xray proxy/shadowsocks/{protocol,config}.go
 
 use anyhow::{bail, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -36,21 +32,17 @@ use crate::config::ShadowsocksCipher;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Maximum plaintext chunk (matches shadowsocks-go / Xray).
-pub const MAX_CHUNK: usize = 0x3FFF; // 16383 bytes
+pub const MAX_CHUNK: usize = 0x3FFF;
 
 // ── Key derivation ────────────────────────────────────────────────────────────
 
-/// Derive a per-session subkey with HKDF-SHA1 ("ss-subkey").
 pub fn derive_subkey(key: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
     let hk = Hkdf::<Sha1>::new(Some(salt), key);
     let mut okm = vec![0u8; key_len];
-    hk.expand(b"ss-subkey", &mut okm)
-        .expect("HKDF expand failed");
+    hk.expand(b"ss-subkey", &mut okm).expect("HKDF expand failed");
     okm
 }
 
-/// Derive a fixed-length master key from a password using EVP_BytesToKey (MD5).
 pub fn evp_bytes_to_key(password: &str, key_len: usize) -> Vec<u8> {
     use md5::{Digest, Md5};
     let mut key = Vec::with_capacity(key_len);
@@ -88,13 +80,10 @@ pub fn aead_decrypt(cipher: &ShadowsocksCipher, key: &[u8], nonce: &[u8; 12], ct
     r.map_err(|_| anyhow::anyhow!("AEAD decrypt failed"))
 }
 
-/// Little-endian counter increment (Shadowsocks AEAD nonce spec).
 pub fn increment_nonce(n: &mut [u8; 12]) {
     for b in n.iter_mut() {
         *b = b.wrapping_add(1);
-        if *b != 0 {
-            break;
-        }
+        if *b != 0 { break; }
     }
 }
 
@@ -104,47 +93,47 @@ const ATYP_IPV4: u8   = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8   = 0x04;
 
-/// Read SOCKS5-style address from an async reader → `"host:port"`.
-pub async fn read_address<R: AsyncRead + Unpin>(r: &mut R) -> Result<String> {
-    let atyp = r.read_u8().await?;
+/// Read SOCKS5-style address from an `AeadReader` → `"host:port"`.
+pub async fn read_address<R: AsyncRead + Unpin>(r: &mut AeadReader<R>) -> Result<String> {
+    let mut buf = [0u8; 1];
+    r.read_exact_plain(&mut buf).await?;
+    let atyp = buf[0];
+
     let host = match atyp {
         ATYP_IPV4 => {
             let mut b = [0u8; 4];
-            r.read_exact(&mut b).await?;
+            r.read_exact_plain(&mut b).await?;
             Ipv4Addr::from(b).to_string()
         }
         ATYP_DOMAIN => {
-            let len = r.read_u8().await? as usize;
+            let mut lb = [0u8; 1];
+            r.read_exact_plain(&mut lb).await?;
+            let len = lb[0] as usize;
             let mut b = vec![0u8; len];
-            r.read_exact(&mut b).await?;
+            r.read_exact_plain(&mut b).await?;
             String::from_utf8(b)?
         }
         ATYP_IPV6 => {
             let mut b = [0u8; 16];
-            r.read_exact(&mut b).await?;
+            r.read_exact_plain(&mut b).await?;
             format!("[{}]", Ipv6Addr::from(b))
         }
         _ => bail!("shadowsocks: unknown ATYP {atyp:#x}"),
     };
-    let port = r.read_u16().await?;
+
+    let mut pb = [0u8; 2];
+    r.read_exact_plain(&mut pb).await?;
+    let port = u16::from_be_bytes(pb);
     Ok(format!("{host}:{port}"))
 }
 
-// ── Async AEAD codec (read/write via explicit async fn, not poll_*) ───────────
-//
-// Rather than implementing AsyncRead/AsyncWrite directly (which requires a
-// poll-based state machine that cannot call async fns), we expose simple
-// async methods.  The relay loop drives them with `tokio::io::copy` by
-// wrapping them in a thin adapter only when needed — but for the internal
-// relay we just use these methods directly via two tasks.
+// ── AeadReader ────────────────────────────────────────────────────────────────
 
-/// Decrypts a Shadowsocks AEAD stream.
 pub struct AeadReader<R> {
     pub inner: R,
     pub cipher: ShadowsocksCipher,
     pub subkey: Vec<u8>,
     pub nonce: [u8; 12],
-    /// Decrypted bytes not yet consumed by the caller
     pub buf: BytesMut,
 }
 
@@ -153,13 +142,12 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
         Self { inner, cipher, subkey, nonce: [0u8; 12], buf: BytesMut::new() }
     }
 
-    /// Read exactly one AEAD chunk from the wire and append plaintext to `self.buf`.
+    /// Decrypt one AEAD chunk from the wire into `self.buf`.
     /// Returns `false` on clean EOF.
-    pub async fn read_chunk(&mut self) -> Result<bool> {
+    async fn fill_buf(&mut self) -> Result<bool> {
         let tag_len = self.cipher.tag_len();
-        let len_ct_len = 2 + tag_len;
 
-        let mut len_ct = vec![0u8; len_ct_len];
+        let mut len_ct = vec![0u8; 2 + tag_len];
         match self.inner.read_exact(&mut len_ct).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
@@ -178,13 +166,13 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
         Ok(true)
     }
 
-    /// Read bytes into `dst` (fills `dst` fully, may read multiple chunks).
-    pub async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize> {
+    /// Read exactly `dst.len()` plaintext bytes (decrypting as needed).
+    pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> Result<()> {
         let mut written = 0;
         while written < dst.len() {
             if self.buf.is_empty() {
-                if !self.read_chunk().await? {
-                    break; // EOF
+                if !self.fill_buf().await? {
+                    bail!("shadowsocks: unexpected EOF reading address");
                 }
             }
             let n = self.buf.len().min(dst.len() - written);
@@ -192,11 +180,25 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
             self.buf.advance(n);
             written += n;
         }
-        Ok(written)
+        Ok(())
+    }
+
+    /// Read up to `dst.len()` plaintext bytes. Returns bytes read (0 = EOF).
+    pub async fn read_plain(&mut self, dst: &mut [u8]) -> Result<usize> {
+        if self.buf.is_empty() {
+            if !self.fill_buf().await? {
+                return Ok(0);
+            }
+        }
+        let n = self.buf.len().min(dst.len());
+        dst[..n].copy_from_slice(&self.buf[..n]);
+        self.buf.advance(n);
+        Ok(n)
     }
 }
 
-/// Encrypts data as a Shadowsocks AEAD stream.
+// ── AeadWriter ────────────────────────────────────────────────────────────────
+
 pub struct AeadWriter<W> {
     pub inner: W,
     pub cipher: ShadowsocksCipher,
@@ -215,7 +217,7 @@ impl<W: AsyncWrite + Unpin> AeadWriter<W> {
         Ok(())
     }
 
-    /// Reset subkey and nonce counter — called after writing the response salt.
+    /// Reset subkey and nonce — called after writing the response salt.
     pub fn reset_subkey(&mut self, new_subkey: Vec<u8>) {
         self.subkey = new_subkey;
         self.nonce = [0u8; 12];
@@ -237,7 +239,6 @@ impl<W: AsyncWrite + Unpin> AeadWriter<W> {
 
             self.inner.write_all(&len_ct).await?;
             self.inner.write_all(&payload_ct).await?;
-
             offset += chunk_len;
         }
         Ok(())
