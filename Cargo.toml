@@ -88,3 +88,7 @@ md-5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
 crc32fast = "1"            # VMess auth_id CRC32 verification
 
 [profile.release]
+strip         = "symbols"  # 剥离调试符号表，不影响运行
+debug         = false      # 不内嵌调试信息
+lto           = "thin"     # 跨 crate 裁掉未调用的代码，thin 构建速度可接受
+codegen-units = 1          # 单编译单元，允许更完整的内联分析
