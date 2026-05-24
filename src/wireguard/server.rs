@@ -151,19 +151,8 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
                 let Some(ep) = ep else { continue };
 
                 let mut tun = peer.tunnel.lock().await;
-                loop {
-                    match tun.encapsulate(&ip_pkt, &mut enc_buf) {
-                        TunnResult::WriteToNetwork(pkt) => {
-                            let _ = socket_enc.send_to(pkt, ep).await;
-                            break;
-                        }
-                        TunnResult::Done => break,
-                        TunnResult::Err(e) => {
-                            debug!("[wireguard] encapsulate: {e:?}");
-                            break;
-                        }
-                        _ => break,
-                    }
+                if let TunnResult::WriteToNetwork(pkt) = tun.encapsulate(&ip_pkt, &mut enc_buf) {
+                    let _ = socket_enc.send_to(pkt, ep).await;
                 }
             }
         });
