@@ -17,6 +17,7 @@ pub struct Config {
     pub trojan: Option<TrojanConfig>,
     pub vmess: Option<VmessConfig>,
     pub shadowsocks: Option<ShadowsocksConfig>,
+    pub wireguard: Option<WireGuardConfig>,
 }
 
 // ── TUIC ──────────────────────────────────────────────────────────────────────
@@ -261,6 +262,61 @@ pub struct ShadowsocksConfig {
     pub transport: TransportConfig,
     /// Optional TLS. Use [shadowsocks.tls] in config.toml.
     pub tls: Option<StandardTlsConfig>,
+}
+
+
+// ── WireGuard ─────────────────────────────────────────────────────────────────
+
+/// Server-side WireGuard configuration.
+///
+/// Corresponds to sing-box's WireGuardEndpointOptions / PeerOptions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WireGuardConfig {
+    /// UDP listen address, e.g. "0.0.0.0:51820"
+    pub listen: String,
+
+    /// Server private key (Base64-encoded 32-byte X25519 secret key).
+    /// Generate with: `wg genkey`
+    pub private_key: String,
+
+    /// Server-side tunnel addresses (CIDRs the server owns on the virtual link).
+    /// Example: ["10.0.0.1/24", "fd00::1/64"]
+    /// These are the IPs the smoltcp virtual interface will be assigned.
+    #[serde(default)]
+    pub server_address: Vec<String>,
+
+    /// MTU for the virtual tunnel interface (default: 1420).
+    #[serde(default = "default_wg_mtu")]
+    pub mtu: u16,
+
+    /// One entry per client peer.
+    pub peers: Vec<WireGuardPeerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WireGuardPeerConfig {
+    /// Client public key (Base64-encoded 32-byte X25519 public key).
+    /// Generate with: `wg pubkey < private.key`
+    pub public_key: String,
+
+    /// Optional pre-shared key (Base64-encoded 32 bytes) for post-quantum resistance.
+    pub pre_shared_key: Option<String>,
+
+    /// IP prefixes this peer is allowed to send from inside the tunnel.
+    /// Examples: ["10.0.0.2/32"], ["10.0.0.0/24", "::/0"]
+    pub allowed_ips: Vec<String>,
+
+    /// Persistent keepalive interval in seconds (0 = disabled).
+    #[serde(default)]
+    pub keepalive_interval: Option<u16>,
+
+    /// DNS servers to use for this peer's traffic (optional).
+    #[serde(default)]
+    pub dns: Vec<String>,
+}
+
+fn default_wg_mtu() -> u16 {
+    1420
 }
 
 fn default_ss_cipher() -> ShadowsocksCipher {

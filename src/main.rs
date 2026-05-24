@@ -1,5 +1,6 @@
 mod common;
 mod config;
+mod wireguard;
 mod hysteria2;
 mod shadowsocks;
 mod trojan;
@@ -43,9 +44,10 @@ async fn main() -> Result<()> {
         && cfg.trojan.is_none()
         && cfg.vmess.is_none()
         && cfg.shadowsocks.is_none()
+        && cfg.wireguard.is_none()
     {
         anyhow::bail!(
-            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], or [shadowsocks] section"
+            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], [shadowsocks], or [wireguard] section"
         );
     }
 
@@ -133,6 +135,20 @@ async fn main() -> Result<()> {
         let h = tokio::spawn(async move {
             if let Err(e) = tuic::run(tuic_cfg).await {
                 tracing::error!("[tuic] server exited with error: {e:#}");
+            }
+        });
+        handles.push(h);
+    }
+
+
+    // ── WireGuard server ──────────────────────────────────────────────────────
+    if let Some(wg_cfg) = cfg.wireguard.clone() {
+        let wg_cfg = Arc::new(wg_cfg);
+        info!("[wireguard] enabled, listen: {}", wg_cfg.listen);
+        info!("[wireguard] peers: {}", wg_cfg.peers.len());
+        let h = tokio::spawn(async move {
+            if let Err(e) = wireguard::server::run(wg_cfg).await {
+                tracing::error!("[wireguard] server exited with error: {e:#}");
             }
         });
         handles.push(h);
