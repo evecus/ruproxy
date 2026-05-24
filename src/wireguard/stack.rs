@@ -81,7 +81,7 @@ enum Msg {
     /// 来自真实远端 TCP 连接的数据 → 注入 smoltcp 发送缓冲区。
     TcpData { handle: SocketHandle, data: Vec<u8> },
     /// 来自真实远端 UDP socket 的回包 → 注入 smoltcp UDP 发送缓冲区。
-    UdpReply { handle: SocketHandle, from: SocketAddr, data: Vec<u8> },
+    UdpReply { handle: SocketHandle, data: Vec<u8> },
     /// 定时器滴答：驱动 smoltcp 内部定时器、排空缓冲区。
     Tick,
 }
@@ -506,15 +506,11 @@ fn spawn_udp_relay(
             }
 
             // 以 1 s 超时等回包（DNS 等协议单次交互）。
-            match time::timeout(Duration::from_secs(1), sock.recv_from(&mut reply_buf)).await {
-                Ok(Ok((n, from))) => {
-                    let _ = actor_tx.send(Msg::UdpReply {
-                        handle,
-                        from,
-                        data: reply_buf[..n].to_vec(),
-                    }).await;
-                }
-                _ => {} // 超时或错误，忽略
+            if let Ok(Ok((n, _from))) = time::timeout(Duration::from_secs(1), sock.recv_from(&mut reply_buf)).await {
+                let _ = actor_tx.send(Msg::UdpReply {
+                    handle,
+                    data: reply_buf[..n].to_vec(),
+                }).await;
             }
         }
     });
