@@ -98,8 +98,6 @@ smoltcp = { version = "0.11", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
-    "proto-tcp",
-    "proto-udp",
     "socket-tcp",
     "socket-udp",
     "async",
