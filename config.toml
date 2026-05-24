@@ -161,21 +161,40 @@ xhttp_path = "/stream"
 cert_path = "/etc/certs/tls.crt"
 key_path  = "/etc/certs/tls.key"
 
-# ── WireGuard ─────────────────────────────────────────────────────────────────
-# Remove or comment out this entire section to disable WireGuard.
+# ══════════════════════════════════════════════════════════════════════════════
+# WireGuard VPN 服务端
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# Quick key generation (requires wireguard-tools):
-#   wg genkey | tee server_private.key | wg pubkey > server_public.key
-#   wg genkey | tee peer_private.key   | wg pubkey > peer_public.key
+# 生成密钥（需安装 wireguard-tools）：
+#   服务端：wg genkey | tee server.key | wg pubkey > server.pub
+#   客户端：wg genkey | tee client.key | wg pubkey > client.pub
 #
-# [wireguard]
-# listen          = "0.0.0.0:51820"
-# private_key     = "<base64-encoded server private key from `wg genkey`>"
-# server_address  = ["10.0.0.1/24"]   # 服务端隧道 IP（smoltcp 虚拟接口地址）
-# mtu             = 1420              # optional, default 1420
+# 客户端 wg0.conf 示例：
+#   [Interface]
+#   PrivateKey = <client.key 内容>
+#   Address    = 10.0.0.2/24
+#   DNS        = 1.1.1.1
 #
+#   [Peer]
+#   PublicKey  = <server.pub 内容>
+#   Endpoint   = your.server.com:51820
+#   AllowedIPs = 0.0.0.0/0, ::/0      # 全流量走 VPN
+#   PersistentKeepalive = 25
+
+[wireguard]
+listen         = "0.0.0.0:51820"
+private_key    = "SERVER_PRIVATE_KEY_BASE64"   # cat server.key
+server_address = ["10.0.0.1/24"]              # 服务端虚拟接口地址
+# mtu          = 1420                          # 默认 1420，一般无需修改
+
+# 客户端 #1
+[[wireguard.peers]]
+public_key          = "CLIENT1_PUBLIC_KEY_BASE64"  # cat client.pub
+allowed_ips         = ["10.0.0.2/32"]              # 该客户端的隧道内 IP
+# pre_shared_key    = "PSK_BASE64"                 # 可选：增强后量子安全性
+# keepalive_interval = 25                          # 秒；服务端主动 keepalive
+
+# 客户端 #2（多客户端时追加）
 # [[wireguard.peers]]
-# public_key          = "<base64-encoded client public key from `wg pubkey`>"
-# allowed_ips         = ["10.0.0.2/32"]        # inner-tunnel IP(s) this client may use
-# # pre_shared_key    = "<optional base64 PSK>" # for extra post-quantum security
-# # keepalive_interval = 25                     # seconds; 0 = disabled
+# public_key  = "CLIENT2_PUBLIC_KEY_BASE64"
+# allowed_ips = ["10.0.0.3/32"]
