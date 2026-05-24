@@ -100,8 +100,7 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
             peer_cfg.keepalive_interval,
             idx as u32,
             None,
-        )
-        .map_err(|e| anyhow::anyhow!("boringtun Tunn::new: {e}"))?;
+        );
 
         let mut allowed_ips: Vec<IpNetwork> = Vec::new();
         for cidr in &peer_cfg.allowed_ips {
