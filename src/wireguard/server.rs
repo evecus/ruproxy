@@ -39,13 +39,12 @@ use ip_network::IpNetwork;
 use ip_network_table::IpNetworkTable;
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address};
 use tokio::{net::UdpSocket, sync::mpsc};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::WireGuardConfig;
 use crate::wireguard::{
     peer::Peer,
-    stack::{spawn_stack, EncryptTx, StackTx},
+    stack::{spawn_stack, StackTx},
 };
 
 const MAX_PACKET: usize = 65535;
@@ -110,7 +109,7 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
             allowed_ips.push(net);
         }
 
-        let peer = Peer::new(tunnel, allowed_ips.clone());
+        let peer = Peer::new(Box::new(tunnel), allowed_ips.clone());
         let pub_hex = hex::encode(&pub_bytes);
 
         for net in &allowed_ips {
@@ -330,13 +329,7 @@ fn parse_ip_cidr(s: &str) -> Result<IpCidr> {
     let plen: u8 = plen.parse()?;
     let ip: IpAddr = ip_str.parse()?;
     Ok(match ip {
-        IpAddr::V4(v4) => IpCidr::Ipv4(
-            Ipv4Cidr::new(Ipv4Address(v4.octets()), plen)
-                .map_err(|_| anyhow::anyhow!("bad IPv4 CIDR"))?,
-        ),
-        IpAddr::V6(v6) => IpCidr::Ipv6(
-            smoltcp::wire::Ipv6Cidr::new(Ipv6Address(v6.octets()), plen)
-                .map_err(|_| anyhow::anyhow!("bad IPv6 CIDR"))?,
-        ),
+        IpAddr::V4(v4) => IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address(v4.octets()), plen)),
+        IpAddr::V6(v6) => IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(Ipv6Address(v6.octets()), plen)),
     })
 }

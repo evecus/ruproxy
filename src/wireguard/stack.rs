@@ -198,7 +198,7 @@ async fn run_actor(
             }
 
             // ── 真实远端 UDP 回包 → smoltcp UDP 发送缓冲区 ───────────────────
-            Msg::UdpReply { handle, from, data } => {
+            Msg::UdpReply { handle, from: _, data } => {
                 // 找原始 src（peer 的隧道内 IP）作为 smoltcp UDP 目标端点。
                 let peer_ep = udp_flows.iter()
                     .find(|(_, f)| f.handle == handle)
@@ -423,7 +423,7 @@ async fn drain_udp_recv(
         let sock = iface.sockets.get_mut::<UdpSocket>(flow.handle);
         while sock.can_recv() {
             match sock.recv() {
-                Ok((data, meta)) => {
+                Ok((data, _meta)) => {
                     let _ = flow.outbound_tx
                         .send((key.dst, data.to_vec()))
                         .await;
@@ -454,8 +454,8 @@ fn feed_udp_send(
 ) {
     let sock = iface.sockets.get_mut::<UdpSocket>(handle);
     let meta = UdpMetadata {
-        endpoint:      sock_to_smoltcp(peer_ep),
-        local_address: None,
+        endpoint: sock_to_smoltcp(peer_ep),
+        meta: Default::default(),
     };
     if let Err(e) = sock.send_slice(data, meta) {
         debug!("[wg/stack] UDP send_slice: {e:?}");

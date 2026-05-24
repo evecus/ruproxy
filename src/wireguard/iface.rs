@@ -14,7 +14,7 @@ use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant as SmolInstant,
-    wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address},
+    wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address},
 };
 
 // ── VirtualDevice ─────────────────────────────────────────────────────────────
@@ -57,13 +57,25 @@ impl Device for VirtualDevice {
 }
 
 pub struct VirtRx(Vec<u8>);
+
 impl RxToken for VirtRx {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R { f(&self.0) }
+    // smoltcp 0.11: RxToken::consume takes F: FnOnce(&mut [u8]) -> R
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = self.0;
+        f(&mut buf)
+    }
 }
 
 pub struct VirtTx<'a>(&'a mut VecDeque<Vec<u8>>);
+
 impl<'a> TxToken for VirtTx<'a> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
         self.0.push_back(buf);
@@ -82,12 +94,9 @@ pub struct VirtualIface {
 
 impl VirtualIface {
     /// 创建虚拟接口并分配服务端隧道地址。
-    ///
-    /// `local_addrs`: 服务端在虚拟链路上拥有的 CIDR（如 `10.0.0.1/24`）。
     pub fn new(local_addrs: &[IpCidr]) -> Self {
         let mut device = VirtualDevice::new();
 
-        // HardwareAddress::Ip → Medium::Ip，不需要以太网帧头。
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::now());
 
@@ -97,15 +106,8 @@ impl VirtualIface {
             }
         });
 
-        // 添加默认路由，让 smoltcp 把所有包都通过虚拟接口转发。
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::UNSPECIFIED)
-            .ok();
-        iface
-            .routes_mut()
-            .add_default_ipv6_route(Ipv6Address::UNSPECIFIED)
-            .ok();
+        iface.routes_mut().add_default_ipv4_route(Ipv4Address::UNSPECIFIED).ok();
+        iface.routes_mut().add_default_ipv6_route(Ipv6Address::UNSPECIFIED).ok();
 
         let sockets = SocketSet::new(vec![]);
 
