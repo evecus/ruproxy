@@ -222,40 +222,42 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
         *peer.endpoint.lock().await = Some(src);
 
         // 3. boringtun 解密。
-        let result = {
+        // ip_owned: 把解密结果立即复制出来，释放对 dec_buf 的借用，
+        // 这样步骤 4 的 drain_timers 可以复用同一块缓冲区。
+        let ip_owned: Option<Vec<u8>> = {
             let mut tun = peer.tunnel.lock().await;
             let r = tun.decapsulate(Some(src.ip()), raw, &mut dec_buf);
-            // 握手应答需要立即回发。
-            if let TunnResult::WriteToNetwork(pkt) = &r {
-                let _ = socket.send_to(pkt, src).await;
+            match r {
+                TunnResult::WriteToNetwork(pkt) => {
+                    let _ = socket.send_to(pkt, src).await;
+                    None
+                }
+                TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
+                    Some(pkt.to_vec())  // 立即复制，释放 dec_buf 借用
+                }
+                TunnResult::Done => None,
+                TunnResult::Err(e) => {
+                    warn!("[wireguard] decapsulate from {src}: {e:?}");
+                    None
+                }
             }
-            r
-        };
+        }; // dec_buf 借用在此结束
 
         // 4. 定时器驱动（可能产生 keepalive 包）。
         drain_timers(&peer, &socket, src, &mut dec_buf).await;
 
         // 5. 处理解密结果。
-        let ip_pkt: &[u8] = match &result {
-            TunnResult::WriteToTunnelV4(pkt, _) => pkt,
-            TunnResult::WriteToTunnelV6(pkt, _) => pkt,
-            TunnResult::WriteToNetwork(_) => continue, // 已处理
-            TunnResult::Done              => continue,
-            TunnResult::Err(e) => {
-                warn!("[wireguard] decapsulate from {src}: {e:?}");
-                continue;
-            }
-        };
+        let Some(ip_pkt) = ip_owned else { continue };
 
         // 6. AllowedIPs 检查。
-        if !peer.allows(packet_src_ip(ip_pkt)) {
+        if !peer.allows(packet_src_ip(&ip_pkt)) {
             debug!("[wireguard] src IP not in AllowedIPs, dropping");
             continue;
         }
 
         // 7. 投递给对应 peer 的 smoltcp actor。
         if let Some(stack_tx) = stack_txs.get(&pub_hex) {
-            let _ = stack_tx.send(ip_pkt.to_vec()).await;
+            let _ = stack_tx.send(ip_pkt).await;
         }
     }
 }
