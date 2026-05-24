@@ -100,10 +100,8 @@ smoltcp = { version = "0.11", default-features = false, features = [
     "proto-ipv6",
     "proto-tcp",
     "proto-udp",
-    "proto-icmp",
     "socket-tcp",
     "socket-udp",
-    "socket-icmp",
     "async",
 ] }
 
