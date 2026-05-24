@@ -88,7 +88,7 @@ md-5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
 crc32fast = "1"            # VMess auth_id CRC32 verification
 
 # WireGuard server
-boringtun = { version = "0.6", default-features = false }
+boringtun = { version = "0.7", default-features = false }
 ip_network = "0.4"
 ip_network_table = "0.2"
 # smoltcp: userspace TCP/IP stack for WireGuard VPN exit
