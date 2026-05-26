@@ -23,6 +23,7 @@ static DEFAULT_SCHEME_BYTES: &[u8] = b"stop=8\n\
     7=500-1000";
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct PaddingScheme {
     /// Packet index at which padding stops (exclusive).
     pub stop: u32,
@@ -66,6 +67,7 @@ impl PaddingScheme {
 
     /// Generate TLS record payload sizes for packet index `pkt`.
     /// Returns an empty slice if no rule exists (send the packet as-is).
+    #[allow(dead_code)]
     pub fn sizes_for(&self, pkt: u32) -> &[i64] {
         self.rules.get(&pkt).map(|v| v.as_slice()).unwrap_or(&[])
     }
