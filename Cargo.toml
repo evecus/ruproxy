@@ -89,8 +89,6 @@ blake3 = "1"
 # AnyTLS: SHA-256 password hashing
 # (sha2 already included above)
 
-# AnyTLS: MD5 for padding scheme fingerprinting
-md5 = "0.7"
 
 # WireGuard server
 boringtun = { version = "0.7", default-features = false }
