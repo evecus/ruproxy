@@ -96,7 +96,7 @@ pub fn now_unix_secs() -> u64 {
 
 pub fn check_timestamp(ts: u64) -> Result<()> {
     let now = now_unix_secs();
-    let diff = if ts > now { ts - now } else { now - ts };
+    let diff = ts.abs_diff(now);
     if diff > MAX_TIMESTAMP_DIFF {
         bail!("shadowsocks 2022: timestamp diff {diff}s exceeds {MAX_TIMESTAMP_DIFF}s limit");
     }
@@ -221,6 +221,7 @@ pub fn parse_request_header(data: &[u8], expected_type: u8) -> Result<String> {
 
 /// Parse the 2022 response fixed header chunk (server→client direction).
 /// Returns the echoed request salt (for replay protection).
+#[allow(dead_code)]
 pub fn parse_response_header(data: &[u8], key_len: usize) -> Result<Vec<u8>> {
     // TYPE(1) + TIMESTAMP(8) + REQUEST_SALT(key_len)
     let min_len = 1 + 8 + key_len;
@@ -243,6 +244,7 @@ pub fn parse_response_header(data: &[u8], key_len: usize) -> Result<Vec<u8>> {
 // ── Request header builder ────────────────────────────────────────────────────
 
 /// Build the plaintext request header payload (before AEAD encryption).
+#[allow(dead_code)]
 pub fn build_request_header(target: &str, salt_len: usize) -> Result<Vec<u8>> {
     let mut buf = BytesMut::new();
 
@@ -268,6 +270,7 @@ pub fn build_response_header(request_salt: &[u8]) -> Vec<u8> {
     buf.to_vec()
 }
 
+#[allow(dead_code)]
 fn encode_address(addr: &str, buf: &mut BytesMut) -> Result<()> {
     // addr is "host:port"
     let (host, port_str) = addr.rsplit_once(':')
@@ -333,6 +336,7 @@ impl<R: AsyncRead + Unpin> AeadReader<R> {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub async fn read_exact_plain(&mut self, dst: &mut [u8]) -> Result<()> {
         let mut written = 0;
         while written < dst.len() {
