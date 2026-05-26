@@ -1,8 +1,8 @@
 [package]
 name = "ruproxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A multi-protocol proxy server (Hysteria2 + VLESS + Reality) in Rust"
+description = "A multi-protocol proxy server (Hysteria2 + VLESS + Reality + Shadowsocks 2022 + AnyTLS) in Rust"
 license = "MIT"
 
 [[bin]]
@@ -52,8 +52,6 @@ bytes = "1"
 # Random number generation
 rand = "0.8"
 
-# Shadowsocks AEAD (sha1/md5 moved to Reality crypto block below)
-
 # Hyper HTTP server (used by XHTTP/splithttp transport)
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client", "client-legacy"] }
@@ -70,28 +68,34 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Reality transport dependencies
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
+hex = "0.4"
+libc = "0.2"
+ring = "0.17"
 
-base64 = "0.22"        # decode x25519 keys from config
-hex = "0.4"            # decode Reality short IDs from config
-libc = "0.2"           # MSG_PEEK for TLS ClientHello inspection
+# AEAD ciphers (Shadowsocks 2022 + Reality)
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+crc32fast = "1"
 
-ring = "0.17"          # rustls crypto provider (main.rs: ring::default_provider)
+# Shadowsocks 2022: BLAKE3 key derivation
+blake3 = "1"
 
-# Reality crypto (新增，ring 本身没有 AES-GCM / HKDF 的便捷接口)
-aes-gcm = "0.10"           # AES-128/256-GCM (Reality + Shadowsocks AEAD)
-chacha20poly1305 = "0.10"  # ChaCha20-Poly1305 (Reality + Shadowsocks AEAD)
-hkdf = "0.12"              # HKDF (Reality auth_key + Shadowsocks ss-subkey)
-hmac = "0.12"              # HMAC-SHA512 for Reality certificate Signature
-sha2 = "0.10"              # SHA-256/SHA-512 for HKDF and HMAC
-sha1 = "0.10"              # SHA-1 for Shadowsocks HKDF-SHA1 subkey derivation
-md-5 = "0.10"               # MD5 for Shadowsocks EVP_BytesToKey
-crc32fast = "1"            # VMess auth_id CRC32 verification
+# AnyTLS: SHA-256 password hashing
+# (sha2 already included above)
+
+# AnyTLS: MD5 for padding scheme fingerprinting
+md5 = "0.7"
 
 # WireGuard server
 boringtun = { version = "0.7", default-features = false }
 ip_network = "0.4"
 ip_network_table = "0.2"
-# smoltcp: userspace TCP/IP stack for WireGuard VPN exit
 smoltcp = { version = "0.11", default-features = false, features = [
     "std",
     "log",
@@ -104,7 +108,7 @@ smoltcp = { version = "0.11", default-features = false, features = [
 ] }
 
 [profile.release]
-strip         = "symbols"  # 剥离调试符号表，不影响运行
-debug         = false      # 不内嵌调试信息
-lto           = "thin"     # 跨 crate 裁掉未调用的代码，thin 构建速度可接受
-codegen-units = 1          # 单编译单元，允许更完整的内联分析
+strip         = "symbols"
+debug         = false
+lto           = "thin"
+codegen-units = 1

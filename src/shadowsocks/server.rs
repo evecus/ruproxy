@@ -13,12 +13,14 @@ use crate::common::transport::websocket as shared_ws;
 use crate::common::transport::xhttp::{self, XhttpConfig};
 use crate::config::ShadowsocksConfig;
 use crate::shadowsocks::protocol::{
-    derive_subkey, evp_bytes_to_key, read_address, AeadReader, AeadWriter,
+    build_response_header, decode_master_key, derive_session_subkey,
+    parse_request_header, AeadReader, AeadWriter, STREAM_TYPE_REQUEST,
 };
+
 
 pub async fn run(cfg: Arc<ShadowsocksConfig>) -> Result<()> {
     let key_len = cfg.method.key_len();
-    let master_key = Arc::new(evp_bytes_to_key(&cfg.password, key_len));
+    let master_key = Arc::new(decode_master_key(&cfg.password, key_len)?);
 
     let tls_acceptor: Option<Arc<TlsAcceptor>> = if let Some(tls_cfg) = &cfg.tls {
         let sc = shared_tls::build(
@@ -69,9 +71,7 @@ async fn handle_conn(
     let xh_host = cfg.transport.xhttp_host.clone();
 
     match (transport, tls_acceptor) {
-        ("tcp", None) => {
-            process(stream, peer, cfg, master_key).await
-        }
+        ("tcp", None) => process(stream, peer, cfg, master_key).await,
         ("tcp", Some(acc)) => {
             let tls = acc.accept(stream).await?;
             process(tls, peer, cfg, master_key).await
@@ -112,19 +112,21 @@ where
     let salt_len = cfg.method.salt_len();
     let cipher = cfg.method.clone();
 
-    // 1. Read client salt
+    // 1. Read client salt (plaintext, key_len bytes)
     let mut client_salt = vec![0u8; salt_len];
     stream.read_exact(&mut client_salt).await?;
 
-    // 2. Derive uplink subkey
-    let up_subkey = derive_subkey(master_key, &client_salt, salt_len);
+    // 2. Derive uplink session subkey (BLAKE3-KDF)
+    let up_subkey = derive_session_subkey(master_key, &client_salt, salt_len);
 
     // 3. Split into AEAD reader + raw writer
     let (read_half, write_half) = tokio::io::split(stream);
     let mut aead_r = AeadReader::new(read_half, cipher.clone(), up_subkey);
 
-    // 4. Parse SOCKS5 address from decrypted stream
-    let target = read_address(&mut aead_r).await?;
+    // 4. Read & validate the 2022 request fixed header chunk
+    //    (TYPE | TIMESTAMP | ATYP | ADDR | PORT | PADDING_LEN | PADDING)
+    let header_data = aead_r.read_header_chunk().await?;
+    let target = parse_request_header(&header_data, STREAM_TYPE_REQUEST)?;
     info!("[shadowsocks] {peer} → {target}");
 
     // 5. Connect upstream
@@ -135,19 +137,25 @@ where
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout: {target}"))??;
 
-    // 6. Write response salt, then switch to downlink subkey
+    // 6. Write response: salt + response header chunk + relay
     let mut resp_salt = vec![0u8; salt_len];
     rand::thread_rng().fill_bytes(&mut resp_salt);
-    let dn_subkey = derive_subkey(master_key, &resp_salt, salt_len);
-    // Initialise with a dummy subkey; we write raw salt first, then reset
+    let dn_subkey = derive_session_subkey(master_key, &resp_salt, salt_len);
+
+    // Write response salt (plaintext), then switch to response subkey
     let mut aead_w = AeadWriter::new(write_half, cipher.clone(), vec![0u8; salt_len]);
     aead_w.write_raw(&resp_salt).await?;
     aead_w.reset_subkey(dn_subkey);
 
+    // 2022 response fixed header: TYPE(1) | TIMESTAMP(8) | REQUEST_SALT(salt_len)
+    let resp_header = build_response_header(&client_salt);
+    aead_w.write_header_chunk(&resp_header).await?;
+    aead_w.flush().await?;
+
     // 7. Relay
     let (mut out_r, mut out_w) = outbound.into_split();
-
     let t = target.clone();
+
     let uplink = async move {
         let mut tmp = vec![0u8; 32 * 1024];
         loop {

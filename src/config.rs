@@ -18,60 +18,37 @@ pub struct Config {
     pub vmess: Option<VmessConfig>,
     pub shadowsocks: Option<ShadowsocksConfig>,
     pub wireguard: Option<WireGuardConfig>,
+    pub anytls: Option<AnyTlsConfig>,
 }
 
 // ── TUIC ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TuicConfig {
-    /// UDP listen address, e.g. "0.0.0.0:443"
     pub listen: String,
-
-    /// UUID → password map for user authentication
     pub users: HashMap<Uuid, String>,
-
-    /// TLS configuration. Use [tuic.tls] in config.toml.
     pub tls: Option<StandardTlsConfig>,
-
-    /// Maximum QUIC idle timeout (e.g. "30s"). Default: 30s
     #[serde(default = "default_tuic_idle_time", with = "humantime_serde")]
     pub max_idle_time: Duration,
-
-    /// How long to wait for authentication before closing (default: 3s)
     #[serde(default = "default_tuic_auth_timeout", with = "humantime_serde")]
     pub auth_timeout: Duration,
-
-    /// UDP relay timeout per session (default: 30s)
     #[serde(default = "default_tuic_udp_timeout", with = "humantime_serde")]
     pub udp_timeout: Duration,
-
-    /// Enable IPv6 UDP relay (default: false)
     #[serde(default)]
     pub udp_relay_ipv6: bool,
-
-    /// Maximum UDP packet size (default: 65535)
     #[serde(default = "default_tuic_max_udp_packet_size")]
     pub max_udp_packet_size: usize,
 }
 
-fn default_tuic_idle_time() -> Duration {
-    Duration::from_secs(30)
-}
-fn default_tuic_auth_timeout() -> Duration {
-    Duration::from_secs(3)
-}
-fn default_tuic_udp_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-fn default_tuic_max_udp_packet_size() -> usize {
-    65535
-}
+fn default_tuic_idle_time() -> Duration { Duration::from_secs(30) }
+fn default_tuic_auth_timeout() -> Duration { Duration::from_secs(3) }
+fn default_tuic_udp_timeout() -> Duration { Duration::from_secs(30) }
+fn default_tuic_max_udp_packet_size() -> usize { 65535 }
 
 // ── Hysteria2 ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Hysteria2Config {
-    /// TCP listen address, e.g. "0.0.0.0:443"
     pub listen: String,
     pub tls: Hy2TlsConfig,
     pub auth: AuthConfig,
@@ -85,7 +62,6 @@ pub struct Hysteria2Config {
 pub struct Hy2TlsConfig {
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
-    /// Used to generate a self-signed cert when cert_path/key_path are not provided.
     pub self_signed_domain: Option<String>,
 }
 
@@ -116,22 +92,15 @@ pub struct MasqueradeProxy {
     pub rewrite_host: bool,
 }
 
-// ── Shared Transport config (reused by VLESS, VMess, Trojan, Shadowsocks) ────
+// ── Shared Transport config ───────────────────────────────────────────────────
 
-/// Controls how raw bytes are carried: plain TCP, WebSocket, or XHTTP.
-/// This is independent of whether TLS is used.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TransportConfig {
-    /// "tcp" (default), "ws", or "xhttp"
     #[serde(default = "default_transport_type")]
     pub r#type: String,
-
-    // ── WebSocket fields (type = "ws" only) ───────────────────────────────
     #[serde(default = "default_ws_path")]
     pub ws_path: String,
     pub ws_host: Option<String>,
-
-    // ── XHTTP fields (type = "xhttp" only) ───────────────────────────────
     #[serde(default = "default_xhttp_path")]
     pub xhttp_path: String,
     pub xhttp_host: Option<String>,
@@ -149,28 +118,17 @@ impl Default for TransportConfig {
     }
 }
 
-
 // ── TLS layer ─────────────────────────────────────────────────────────────────
 
-/// Controls the TLS layer for VLESS. Absence of this field means plaintext.
-///
-/// Two mutually exclusive variants:
-///   [vless.tls]  type = "tls"     → standard TLS with cert + key
-///   [vless.tls]  type = "reality" → Reality camouflage (no cert files needed)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum VlessTlsConfig {
-    /// Standard TLS: supply a certificate file and private key file,
-    /// or let the server generate a self-signed certificate.
     Tls {
         #[serde(flatten)]
         standard: StandardTlsConfig,
     },
-    /// Reality: TLS-camouflage transport.
     Reality(RealityConfig),
 }
-
-// ── Reality config ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityConfig {
@@ -214,113 +172,105 @@ pub struct VmessConfig {
     pub tls: Option<StandardTlsConfig>,
 }
 
-// ── Shadowsocks ───────────────────────────────────────────────────────────────
+// ── Shadowsocks 2022 ──────────────────────────────────────────────────────────
 
-/// Supported Shadowsocks cipher methods (AEAD only; older stream ciphers are
-/// intentionally omitted — they are broken and not used in modern deployments).
+/// Shadowsocks 2022 cipher methods (AEAD-2022 only).
+/// Password must be a base64-encoded key of the correct length.
+/// Key lengths: aes-128-gcm → 16 bytes, aes-256-gcm → 32 bytes, chacha20 → 32 bytes.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShadowsocksCipher {
-    /// AEAD_AES_128_GCM
-    Aes128Gcm,
-    /// AEAD_AES_256_GCM
-    Aes256Gcm,
-    /// AEAD_CHACHA20_POLY1305
-    Chacha20IetfPoly1305,
+    /// 2022-blake3-aes-128-gcm  (16-byte key)
+    #[serde(rename = "2022-blake3-aes-128-gcm")]
+    Blake3Aes128Gcm,
+    /// 2022-blake3-aes-256-gcm  (32-byte key)
+    #[serde(rename = "2022-blake3-aes-256-gcm")]
+    Blake3Aes256Gcm,
+    /// 2022-blake3-chacha20-poly1305  (32-byte key)
+    #[serde(rename = "2022-blake3-chacha20-poly1305")]
+    Blake3Chacha20Poly1305,
 }
 
 impl ShadowsocksCipher {
-    /// Key length in bytes for each cipher.
+    /// Key length in bytes.
     pub fn key_len(&self) -> usize {
         match self {
-            ShadowsocksCipher::Aes128Gcm => 16,
-            ShadowsocksCipher::Aes256Gcm => 32,
-            ShadowsocksCipher::Chacha20IetfPoly1305 => 32,
+            ShadowsocksCipher::Blake3Aes128Gcm => 16,
+            ShadowsocksCipher::Blake3Aes256Gcm => 32,
+            ShadowsocksCipher::Blake3Chacha20Poly1305 => 32,
         }
     }
-    /// Salt length (= key length for AEAD ciphers).
-    pub fn salt_len(&self) -> usize {
-        self.key_len()
-    }
-    /// AEAD tag length (always 16 for the supported ciphers).
-    pub fn tag_len(&self) -> usize {
-        16
-    }
+    /// Salt length = key length for 2022 ciphers.
+    pub fn salt_len(&self) -> usize { self.key_len() }
+    /// AEAD tag length (always 16).
+    pub fn tag_len(&self) -> usize { 16 }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShadowsocksConfig {
     /// TCP listen address, e.g. "0.0.0.0:8388"
     pub listen: String,
-    /// Pre-shared password
+    /// Pre-shared key: base64-encoded bytes matching the cipher key length.
+    /// Generate with: openssl rand -base64 16  (for aes-128)
+    ///                openssl rand -base64 32  (for aes-256 / chacha20)
     pub password: String,
-    /// AEAD cipher method (default: aes-256-gcm)
+    /// 2022 cipher method (default: 2022-blake3-aes-256-gcm)
     #[serde(default = "default_ss_cipher")]
     pub method: ShadowsocksCipher,
     /// Transport layer (tcp / ws / xhttp). Omit for plain TCP.
     #[serde(default)]
     pub transport: TransportConfig,
-    /// Optional TLS. Use [shadowsocks.tls] in config.toml.
+    /// Optional TLS.
     pub tls: Option<StandardTlsConfig>,
 }
 
+// ── AnyTLS ────────────────────────────────────────────────────────────────────
+
+/// AnyTLS server configuration.
+///
+/// AnyTLS multiplexes streams over a single TLS connection using a lightweight
+/// session layer with padding obfuscation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnyTlsConfig {
+    /// TCP listen address, e.g. "0.0.0.0:8443"
+    pub listen: String,
+    /// Pre-shared password for authentication (sha256 is verified on connection).
+    pub password: String,
+    /// TLS configuration (required — AnyTLS is always over TLS).
+    pub tls: StandardTlsConfig,
+    /// Optional padding scheme override (server-side).
+    /// If unset, the built-in default scheme is used.
+    pub padding_scheme: Option<String>,
+}
 
 // ── WireGuard ─────────────────────────────────────────────────────────────────
 
-/// Server-side WireGuard configuration.
-///
-/// Corresponds to sing-box's WireGuardEndpointOptions / PeerOptions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireGuardConfig {
-    /// UDP listen address, e.g. "0.0.0.0:51820"
     pub listen: String,
-
-    /// Server private key (Base64-encoded 32-byte X25519 secret key).
-    /// Generate with: `wg genkey`
     pub private_key: String,
-
-    /// Server-side tunnel addresses (CIDRs the server owns on the virtual link).
-    /// Example: ["10.0.0.1/24", "fd00::1/64"]
-    /// These are the IPs the smoltcp virtual interface will be assigned.
     #[serde(default)]
     pub server_address: Vec<String>,
-
-    /// MTU for the virtual tunnel interface (default: 1420).
     #[serde(default = "default_wg_mtu")]
     pub mtu: u16,
-
-    /// One entry per client peer.
     pub peers: Vec<WireGuardPeerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireGuardPeerConfig {
-    /// Client public key (Base64-encoded 32-byte X25519 public key).
-    /// Generate with: `wg pubkey < private.key`
     pub public_key: String,
-
-    /// Optional pre-shared key (Base64-encoded 32 bytes) for post-quantum resistance.
     pub pre_shared_key: Option<String>,
-
-    /// IP prefixes this peer is allowed to send from inside the tunnel.
-    /// Examples: ["10.0.0.2/32"], ["10.0.0.0/24", "::/0"]
     pub allowed_ips: Vec<String>,
-
-    /// Persistent keepalive interval in seconds (0 = disabled).
     #[serde(default)]
     pub keepalive_interval: Option<u16>,
-
-    /// DNS servers to use for this peer's traffic (optional).
     #[serde(default)]
     pub dns: Vec<String>,
 }
 
-fn default_wg_mtu() -> u16 {
-    1420
-}
+fn default_wg_mtu() -> u16 { 1420 }
 
 fn default_ss_cipher() -> ShadowsocksCipher {
-    ShadowsocksCipher::Aes256Gcm
+    ShadowsocksCipher::Blake3Aes256Gcm
 }
 
 // ── Shared ────────────────────────────────────────────────────────────────────
@@ -333,9 +283,7 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self {
-            level: default_log_level(),
-        }
+        Self { level: default_log_level() }
     }
 }
 
@@ -363,21 +311,11 @@ impl BandwidthConfig {
     }
 }
 
-fn default_log_level() -> String {
-    "info".to_string()
-}
-fn default_masquerade_type() -> String {
-    "none".to_string()
-}
-fn default_transport_type() -> String {
-    "tcp".to_string()
-}
-fn default_ws_path() -> String {
-    "/".to_string()
-}
-fn default_xhttp_path() -> String {
-    "/".to_string()
-}
+fn default_log_level() -> String { "info".to_string() }
+fn default_masquerade_type() -> String { "none".to_string() }
+fn default_transport_type() -> String { "tcp".to_string() }
+fn default_ws_path() -> String { "/".to_string() }
+fn default_xhttp_path() -> String { "/".to_string() }
 
 pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(Path::new(path))

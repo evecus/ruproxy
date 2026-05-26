@@ -198,3 +198,35 @@ allowed_ips         = ["10.0.0.2/32"]              # 该客户端的隧道内 IP
 # [[wireguard.peers]]
 # public_key  = "CLIENT2_PUBLIC_KEY_BASE64"
 # allowed_ips = ["10.0.0.3/32"]
+
+# ── Shadowsocks 2022 ──────────────────────────────────────────────────────────
+# 2022 加密协议使用 base64 编码的密钥作为密码（不再使用任意字符串）。
+# 生成密钥：
+#   aes-128: openssl rand -base64 16
+#   aes-256 / chacha20: openssl rand -base64 32
+#
+# [shadowsocks]
+# listen   = "0.0.0.0:8388"
+# password = "base64encodedkeyhere="   # 必须是 base64 编码的密钥
+# method   = "2022-blake3-aes-256-gcm" # 或 2022-blake3-aes-128-gcm / 2022-blake3-chacha20-poly1305
+
+# ── AnyTLS ────────────────────────────────────────────────────────────────────
+# AnyTLS 在单条 TLS 连接上多路复用多个 Stream，并通过 padding 混淆流量特征。
+# TLS 是必须的（AnyTLS 协议本身不提供加密，依赖 TLS 层）。
+#
+# [anytls]
+# listen   = "0.0.0.0:8443"
+# password = "your-strong-password"
+#
+# [anytls.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
+# # 或者使用自签名证书：
+# # self_signed_domain = "anytls.local"
+#
+# # 可选：自定义 padding 方案（留空则使用内置默认方案）
+# # padding_scheme = """
+# # stop=8
+# # 0=30-30
+# # 1=100-400
+# # """

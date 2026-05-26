@@ -1,12 +1,13 @@
+mod anytls;
 mod common;
 mod config;
-mod wireguard;
 mod hysteria2;
 mod shadowsocks;
 mod trojan;
 mod tuic;
 mod vless;
 mod vmess;
+mod wireguard;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -15,12 +16,12 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── Install TLS crypto provider (required by rustls + quinn) ─────────────
+    // ── Install TLS crypto provider ───────────────────────────────────────────
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    // ── Parse CLI: ./ruproxy -c config.toml ──────────────────────────────────
+    // ── Parse CLI ─────────────────────────────────────────────────────────────
     let config_path = parse_config_arg();
 
     // ── Load config ───────────────────────────────────────────────────────────
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
 
     info!("ruproxy starting, config: {config_path}");
 
-    // ── Validate: at least one protocol section must be present ───────────────
+    // ── Validate ──────────────────────────────────────────────────────────────
     if cfg.hysteria2.is_none()
         && cfg.vless.is_none()
         && cfg.tuic.is_none()
@@ -45,15 +46,16 @@ async fn main() -> Result<()> {
         && cfg.vmess.is_none()
         && cfg.shadowsocks.is_none()
         && cfg.wireguard.is_none()
+        && cfg.anytls.is_none()
     {
         anyhow::bail!(
-            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], [shadowsocks], or [wireguard] section"
+            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], [shadowsocks], [wireguard], or [anytls] section"
         );
     }
 
     let mut handles = Vec::new();
 
-    // ── Hysteria2 server ──────────────────────────────────────────────────────
+    // ── Hysteria2 ─────────────────────────────────────────────────────────────
     if let Some(hy2_cfg) = cfg.hysteria2.clone() {
         let hy2_cfg = Arc::new(hy2_cfg);
         info!("[hy2] enabled, listen: {}", hy2_cfg.listen);
@@ -65,7 +67,7 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-    // ── VLESS server ──────────────────────────────────────────────────────────
+    // ── VLESS ─────────────────────────────────────────────────────────────────
     if let Some(vless_cfg) = cfg.vless.clone() {
         let vless_cfg = Arc::new(vless_cfg);
         info!("[vless] enabled, listen: {}", vless_cfg.listen);
@@ -74,10 +76,7 @@ async fn main() -> Result<()> {
             Some(crate::config::VlessTlsConfig::Tls { .. }) => "tls",
             Some(crate::config::VlessTlsConfig::Reality(_)) => "reality",
         };
-        info!(
-            "[vless] transport={}, tls={tls_label}",
-            vless_cfg.transport.r#type,
-        );
+        info!("[vless] transport={}, tls={tls_label}", vless_cfg.transport.r#type);
         let h = tokio::spawn(async move {
             if let Err(e) = vless::listener::run(vless_cfg).await {
                 tracing::error!("[vless] server exited with error: {e:#}");
@@ -86,7 +85,7 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-    // ── Trojan server ─────────────────────────────────────────────────────────
+    // ── Trojan ────────────────────────────────────────────────────────────────
     if let Some(trojan_cfg) = cfg.trojan.clone() {
         let trojan_cfg = Arc::new(trojan_cfg);
         info!("[trojan] enabled, listen: {}", trojan_cfg.listen);
@@ -98,7 +97,7 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-    // ── VMess server ──────────────────────────────────────────────────────────
+    // ── VMess ─────────────────────────────────────────────────────────────────
     if let Some(vmess_cfg) = cfg.vmess.clone() {
         let vmess_cfg = Arc::new(vmess_cfg);
         info!("[vmess] enabled, listen: {}", vmess_cfg.listen);
@@ -110,14 +109,12 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-    // ── Shadowsocks server ────────────────────────────────────────────────────
+    // ── Shadowsocks ───────────────────────────────────────────────────────────
     if let Some(ss_cfg) = cfg.shadowsocks.clone() {
         let ss_cfg = Arc::new(ss_cfg);
         info!(
             "[shadowsocks] enabled, listen: {}, method={:?}, transport={}",
-            ss_cfg.listen,
-            ss_cfg.method,
-            ss_cfg.transport.r#type,
+            ss_cfg.listen, ss_cfg.method, ss_cfg.transport.r#type,
         );
         let h = tokio::spawn(async move {
             if let Err(e) = shadowsocks::server::run(ss_cfg).await {
@@ -127,7 +124,7 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-    // ── TUIC server ───────────────────────────────────────────────────────────
+    // ── TUIC ──────────────────────────────────────────────────────────────────
     if let Some(tuic_cfg) = cfg.tuic.clone() {
         let tuic_cfg = Arc::new(tuic_cfg);
         info!("[tuic] enabled, listen: {}", tuic_cfg.listen);
@@ -140,8 +137,7 @@ async fn main() -> Result<()> {
         handles.push(h);
     }
 
-
-    // ── WireGuard server ──────────────────────────────────────────────────────
+    // ── WireGuard ─────────────────────────────────────────────────────────────
     if let Some(wg_cfg) = cfg.wireguard.clone() {
         let wg_cfg = Arc::new(wg_cfg);
         info!("[wireguard] enabled, listen: {}", wg_cfg.listen);
@@ -149,6 +145,18 @@ async fn main() -> Result<()> {
         let h = tokio::spawn(async move {
             if let Err(e) = wireguard::server::run(wg_cfg).await {
                 tracing::error!("[wireguard] server exited with error: {e:#}");
+            }
+        });
+        handles.push(h);
+    }
+
+    // ── AnyTLS ────────────────────────────────────────────────────────────────
+    if let Some(anytls_cfg) = cfg.anytls.clone() {
+        let anytls_cfg = Arc::new(anytls_cfg);
+        info!("[anytls] enabled, listen: {}", anytls_cfg.listen);
+        let h = tokio::spawn(async move {
+            if let Err(e) = anytls::server::run(anytls_cfg).await {
+                tracing::error!("[anytls] server exited with error: {e:#}");
             }
         });
         handles.push(h);
