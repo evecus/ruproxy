@@ -1,169 +1,368 @@
-# ruproxy configuration
-# Only fields relevant to your setup are needed.
-# Omit a [hysteria2] or [vless] section entirely to disable that protocol.
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                        ruproxy v0.2  配置文件模板                          ║
+# ╠══════════════════════════════════════════════════════════════════════════════╣
+# ║  • 每个协议对应一个顶层 section，注释掉整个 section 即可禁用该协议         ║
+# ║  • 同一进程可同时运行多个协议，各自监听不同端口                            ║
+# ║  • 本文件包含所有协议的完整写法，按需取用，其余保持注释                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 
-# ── Logging (optional, default: info) ────────────────────────────────────────
+# ── 日志 ──────────────────────────────────────────────────────────────────────
+# 可选。level: trace | debug | info | warn | error，默认 info
 [log]
-level = "info"   # trace | debug | info | warn | error
+level = "info"
 
-# ── Hysteria2 ─────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. Hysteria2   (QUIC + TLS，抗封锁能力强，适合高丢包环境)
+# ══════════════════════════════════════════════════════════════════════════════
+# 客户端推荐：Hysteria2 官方客户端 / Clash.Meta / sing-box
+#
+# 客户端示例配置（sing-box outbound）：
+#   type: hysteria2
+#   server: your.server.com
+#   server_port: 443
+#   password: your-strong-password-here
+#   tls:
+#     server_name: your.server.com
+#
 [hysteria2]
 listen = "0.0.0.0:443"
 
 [hysteria2.tls]
 cert_path = "/etc/ssl/certs/server.crt"
 key_path  = "/etc/ssl/private/server.key"
-# self_signed_domain = "example.com"   # uncomment to auto-generate a self-signed cert
+# 无证书时可自动生成自签名证书（客户端需跳过验证或信任该证书）：
+# self_signed_domain = "hy2.example.com"
 
 [hysteria2.auth]
 type     = "password"
 password = "your-strong-password-here"
 
-# [hysteria2.bandwidth]          # optional — omit to use unlimited
-# up   = "1000 mbps"
+# 带宽声明（可选，不填则不限速）：
+# [hysteria2.bandwidth]
+# up   = "100 mbps"
+# down = "500 mbps"
 
-# [hysteria2.masquerade]         # optional
-# type = "proxy"    #proxy or none
+# 伪装（可选）：
+# [hysteria2.masquerade]
+# type = "proxy"               # none | proxy
 # [hysteria2.masquerade.proxy]
 # url          = "https://example.com"
 # rewrite_host = true
 
-# ── TUIC ──────────────────────────────────────────────────────────────────────
-# Remove or comment out this entire section to disable TUIC.
-[tuic]
-listen = "0.0.0.0:7443"
-# IMPORTANT: TUIC in this implementation expects QUIC + ALPN = "h3".
-# If client ALPN does not include "h3", handshake can fail with:
-# "peer doesn't support any known protocol".
 
-# UUID → password map. Add one entry per user.
-# Generate a UUID with: uuidgen  (Linux/macOS) or  python3 -c "import uuid; print(uuid.uuid4())"
-[tuic.users]
-"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" = "your-strong-password-here"
-# "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" = "another-user-password"
-
-# TLS certificate. Put TLS under [tuic.tls] to avoid confusion with [tuic.users].
-# [tuic.tls]
-# cert_path = "/etc/ssl/certs/server.crt"
-# key_path  = "/etc/ssl/private/server.key"
-# or
-# self_signed_domain = "tuic.local"   # domain name in the self-signed cert
-
-# Optional tuning (shown with defaults, safe to omit):
-# max_idle_time    = "30s"
-# auth_timeout     = "3s"
-# udp_timeout      = "30s"
-# udp_relay_ipv6   = false
-# max_udp_packet_size = 65535
-
-# ── VLESS ─────────────────────────────────────────────────────────────────────
-# Remove or comment out this entire section to disable VLESS.
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. VLESS   (轻量无加密头，必须配合 TLS 或 Reality 使用)
+# ══════════════════════════════════════════════════════════════════════════════
+# 生成 UUID：uuidgen  或  python3 -c "import uuid; print(uuid.uuid4())"
+#
+# 支持三种 TLS 模式（任选其一）：
+#   A. 标准 TLS（需要域名 + 证书）
+#   B. Reality（无需证书，借用真实网站 TLS 指纹）
+#   C. 无 TLS（明文，仅内网 / 已有外层 TLS 时使用）
+#
+# 支持三种传输层（任选其一）：
+#   tcp（默认）| ws（WebSocket）| xhttp（HTTP 分块流）
+#
+# ── 2-A: VLESS + 标准 TLS + TCP ──────────────────────────────────────────────
 [vless]
 listen = "0.0.0.0:8443"
 uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
-# Transport layer: tcp (default, can omit) or ws.
-# Controls how bytes are carried — independent of TLS.
-# [vless.transport]
-# type    = "tcp"    # tcp | ws
+[vless.tls]
+type      = "tls"
+cert_path = "/etc/ssl/certs/server.crt"
+key_path  = "/etc/ssl/private/server.key"
+# self_signed_domain = "vless.example.com"
 
-# For WebSocket:
+# ── 2-B: VLESS + Reality（注释掉上面的 [vless] 块，启用此块）────────────────
+# 生成密钥对：
+#   docker run --rm ghcr.io/xtls/xray-core x25519
+#   或  openssl genpkey -algorithm x25519 | openssl pkey -text -noout
+#
+# [vless]
+# listen = "0.0.0.0:443"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+# [vless.tls]
+# type        = "reality"
+# private_key = "YOUR_X25519_PRIVATE_KEY_BASE64"
+# public_key  = "YOUR_X25519_PUBLIC_KEY_BASE64"
+# short_ids   = ["deadbeef", "cafebabe"]   # 任意 1–8 字节 hex 串
+# dest        = "example.com:443"          # 要借用 TLS 指纹的真实站点
+# server_name = "example.com"
+
+# ── 2-C: VLESS + TLS + WebSocket ─────────────────────────────────────────────
+# 适合套 CDN（Cloudflare 等仅支持 WebSocket 的场景）
+#
+# [vless]
+# listen = "0.0.0.0:443"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
 # [vless.transport]
 # type    = "ws"
 # ws_path = "/vless"
-# ws_host = "your.domain.com"   # optional: enforce Host header
-
-# TLS layer: omit entirely for plaintext.
-# Two mutually exclusive types:
-
-# ── Option A: standard TLS ────────────────────────────────────────────────────
-[vless.tls]
-type = "tls"
-cert_path = "/etc/ssl/certs/server.crt"
-key_path  = "/etc/ssl/private/server.key"
-# self_signed_domain = "example.com"   # alternative to cert_path/key_path
-
-# ── Option B: Reality ─────────────────────────────────────────────────────────
+# ws_host = "your.domain.com"   # 可选：严格校验 Host 头
+#
 # [vless.tls]
-# type        = "reality"
-# private_key = "<base64-encoded x25519 private key>"
-# public_key  = "<base64-encoded x25519 public key>"
-# short_ids   = ["ef567890"]
-# dest        = "example.com:443"
-# server_name = "example.com"
+# type      = "tls"
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
 
+# ── 2-D: VLESS + TLS + XHTTP（HTTP 分块流，抗中间人重组）───────────────────
+#
+# [vless]
+# listen = "0.0.0.0:443"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+# [vless.transport]
+# type       = "xhttp"
+# xhttp_path = "/stream"
+# xhttp_host = "your.domain.com"   # 可选
+#
+# [vless.tls]
+# type      = "tls"
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. VMess   (带 AES/ChaCha 头部加密，兼容性最广)
+# ══════════════════════════════════════════════════════════════════════════════
+# 支持的传输层：tcp | ws | xhttp
+# 支持可选 TLS 层（不配置则明文）
+#
+# ── 3-A: VMess + TLS + TCP ───────────────────────────────────────────────────
 [vmess]
 listen = "0.0.0.0:9443"
-uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # 替换为你的 UUID
+uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
-# 可选：传输层，默认 TCP
-# [vmess.transport]
-# type    = "ws"         # tcp | ws
-# ws_path = "/vmess"    # WebSocket 路径
-# ws_host = "your.domain.com"  # 可选
-
-# 可选：TLS 层，不填则明文
 [vmess.tls]
 cert_path = "/etc/ssl/certs/server.crt"
 key_path  = "/etc/ssl/private/server.key"
-# self_signed_domain = "example.com"  # 自动生成自签名证书的备选方案
+# self_signed_domain = "vmess.example.com"
 
+# ── 3-B: VMess + TLS + WebSocket ─────────────────────────────────────────────
+#
+# [vmess]
+# listen = "0.0.0.0:443"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+# [vmess.transport]
+# type    = "ws"
+# ws_path = "/vmess"
+# ws_host = "your.domain.com"
+#
+# [vmess.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
+
+# ── 3-C: VMess + TLS + XHTTP ─────────────────────────────────────────────────
+#
+# [vmess]
+# listen = "0.0.0.0:443"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+#
+# [vmess.transport]
+# type       = "xhttp"
+# xhttp_path = "/api"
+#
+# [vmess.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
+
+# ── 3-D: VMess 明文（内网 / 已有外层加密时）──────────────────────────────────
+#
+# [vmess]
+# listen = "0.0.0.0:10000"
+# uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Trojan   (HTTPS 伪装，流量特征与正常 HTTPS 一致)
+# ══════════════════════════════════════════════════════════════════════════════
+# 支持的传输层：tcp | ws | xhttp
+#
+# ── 4-A: Trojan + TLS + TCP ──────────────────────────────────────────────────
 [trojan]
 listen   = "0.0.0.0:10443"
 password = "your-strong-password-here"
 
-# 可选：传输层，默认 TCP
+[trojan.tls]
+cert_path = "/etc/ssl/certs/server.crt"
+key_path  = "/etc/ssl/private/server.key"
+# self_signed_domain = "trojan.example.com"
+
+# ── 4-B: Trojan + TLS + WebSocket ────────────────────────────────────────────
+#
+# [trojan]
+# listen   = "0.0.0.0:443"
+# password = "your-strong-password-here"
+#
 # [trojan.transport]
 # type    = "ws"
 # ws_path = "/trojan"
 # ws_host = "your.domain.com"
+#
+# [trojan.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
 
-# 可选：TLS 层
-[trojan.tls]
-cert_path = "/etc/ssl/certs/server.crt"
-key_path  = "/etc/ssl/private/server.key"
-# self_signed_domain = "example.com"
+# ── 4-C: Trojan + TLS + XHTTP ────────────────────────────────────────────────
+#
+# [trojan]
+# listen   = "0.0.0.0:443"
+# password = "your-strong-password-here"
+#
+# [trojan.transport]
+# type       = "xhttp"
+# xhttp_path = "/cdn"
+#
+# [trojan.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
 
-# Shadowsocks + 纯 TCP
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Shadowsocks 2022   (2022-blake3-* 系列，现代高性能 AEAD)
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠  密码不再是任意字符串，必须是 base64 编码的随机密钥字节。
+#
+# 生成密钥：
+#   2022-blake3-aes-128-gcm      →  openssl rand -base64 16
+#   2022-blake3-aes-256-gcm      →  openssl rand -base64 32
+#   2022-blake3-chacha20-poly1305 → openssl rand -base64 32
+#
+# 支持的传输层：tcp | ws | xhttp
+# 支持可选 TLS 层（多一层 TLS 可隐藏 Shadowsocks 握手特征）
+#
+# ── 5-A: Shadowsocks 2022 + 纯 TCP ───────────────────────────────────────────
 [shadowsocks]
 listen   = "0.0.0.0:8388"
-password = "my-secret"
-method   = "aes-256-gcm"
+method   = "2022-blake3-aes-256-gcm"
+password = "REPLACE_WITH_BASE64_32_BYTES="   # openssl rand -base64 32
 
-# Shadowsocks + WebSocket + TLS
-[shadowsocks]
-listen   = "0.0.0.0:443"
-password = "my-secret"
-method   = "chacha20-ietf-poly1305"
-[shadowsocks.transport]
-type    = "ws"
-ws_path = "/shadow"
-[shadowsocks.tls]
-cert_path = "/etc/certs/tls.crt"
-key_path  = "/etc/certs/tls.key"
+# ── 5-B: Shadowsocks 2022 + WebSocket + TLS ──────────────────────────────────
+# 适合套 CDN，客户端需配置 ws 传输
+#
+# [shadowsocks]
+# listen   = "0.0.0.0:443"
+# method   = "2022-blake3-aes-256-gcm"
+# password = "REPLACE_WITH_BASE64_32_BYTES="
+#
+# [shadowsocks.transport]
+# type    = "ws"
+# ws_path = "/shadow"
+# ws_host = "your.domain.com"   # 可选：严格校验 Host
+#
+# [shadowsocks.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
 
-# VLESS + XHTTP（无 TLS）
-[vless]
-listen = "0.0.0.0:8080"
-uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-[vless.transport]
-type       = "xhttp"
-xhttp_path = "/api"
+# ── 5-C: Shadowsocks 2022 + XHTTP + TLS ──────────────────────────────────────
+#
+# [shadowsocks]
+# listen   = "0.0.0.0:443"
+# method   = "2022-blake3-chacha20-poly1305"
+# password = "REPLACE_WITH_BASE64_32_BYTES="
+#
+# [shadowsocks.transport]
+# type       = "xhttp"
+# xhttp_path = "/data"
+#
+# [shadowsocks.tls]
+# cert_path = "/etc/ssl/certs/server.crt"
+# key_path  = "/etc/ssl/private/server.key"
 
-# VMess + XHTTP + TLS
-[vmess]
-listen = "0.0.0.0:443"
-uuid   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-[vmess.transport]
-type       = "xhttp"
-xhttp_path = "/stream"
-[vmess.tls]
-cert_path = "/etc/certs/tls.crt"
-key_path  = "/etc/certs/tls.key"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WireGuard VPN 服务端
+# 6. TUIC v5   (QUIC 多路复用，低延迟 UDP 转发)
 # ══════════════════════════════════════════════════════════════════════════════
+# 注意：TUIC 使用 QUIC 协议，客户端 ALPN 必须包含 "h3"。
+# 支持多用户（UUID → 密码 映射）。
+#
+# 生成 UUID：uuidgen  或  python3 -c "import uuid; print(uuid.uuid4())"
+#
+[tuic]
+listen = "0.0.0.0:7443"
+
+# 多用户表，格式：UUID = "密码"
+[tuic.users]
+"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" = "user1-password"
+# "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" = "user2-password"
+
+[tuic.tls]
+cert_path = "/etc/ssl/certs/server.crt"
+key_path  = "/etc/ssl/private/server.key"
+# self_signed_domain = "tuic.example.com"
+
+# 性能调优（以下均为默认值，可整块省略）：
+# [tuic]
+# max_idle_time       = "30s"    # QUIC 连接最大空闲时间
+# auth_timeout        = "3s"     # 认证超时
+# udp_timeout         = "30s"    # UDP 会话超时
+# udp_relay_ipv6      = false    # 是否允许 UDP IPv6 转发
+# max_udp_packet_size = 65535    # UDP 最大包大小（字节）
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. AnyTLS   (TLS 连接复用 + 流量 padding 混淆)
+# ══════════════════════════════════════════════════════════════════════════════
+# AnyTLS 在单条 TLS 连接上多路复用多个 Stream，通过动态 padding 方案
+# 混淆前 N 个 TLS 记录的大小特征，有效对抗流量指纹识别。
+# TLS 是必须的（协议本身不提供加密层）。
+#
+# 架构：  客户端 TCP/UDP → Stream → Session → TLS → 服务端
+#
+# 客户端推荐：sing-box（anytls outbound）/ Clash.Meta
+#
+# 客户端示例（sing-box outbound）：
+#   type: anytls
+#   server: your.server.com
+#   server_port: 8443
+#   password: your-strong-password
+#   tls:
+#     server_name: your.server.com
+#
+[anytls]
+listen   = "0.0.0.0:8443"
+password = "your-strong-password"
+
+[anytls.tls]
+cert_path = "/etc/ssl/certs/server.crt"
+key_path  = "/etc/ssl/private/server.key"
+# self_signed_domain = "anytls.example.com"
+
+# padding_scheme（可选）：控制前 N 个 TLS 记录的大小策略。
+# 留空则使用内置默认方案（与 anytls-go 官方一致）。
+# 服务端会在首次连接时将当前方案下发给客户端，客户端后续连接自动同步。
+#
+# 格式说明：
+#   stop=N         第 0 到 N-1 个包启用 padding，之后直接发送
+#   0=30-30        第 0 个包：固定 30 字节（认证包 padding）
+#   1=100-400      第 1 个包：随机 100–400 字节
+#   2=400-500,c,500-1000,c,...
+#                  第 2 个包分多段发：c 表示"若此时数据已发完则停止"
+#
+# [anytls]
+# padding_scheme = """
+# stop=8
+# 0=30-30
+# 1=100-400
+# 2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
+# 3=9-9,500-1000
+# 4=500-1000
+# 5=500-1000
+# 6=500-1000
+# 7=500-1000
+# """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. WireGuard   (内核级 VPN，全流量隧道)
+# ══════════════════════════════════════════════════════════════════════════════
+# ruproxy 实现为用户态 WireGuard 服务端（基于 boringtun + smoltcp）。
+# 适用于需要完整 VPN 隧道（而非 SOCKS5/HTTP 代理）的场景。
 #
 # 生成密钥（需安装 wireguard-tools）：
 #   服务端：wg genkey | tee server.key | wg pubkey > server.pub
@@ -176,57 +375,25 @@ key_path  = "/etc/certs/tls.key"
 #   DNS        = 1.1.1.1
 #
 #   [Peer]
-#   PublicKey  = <server.pub 内容>
-#   Endpoint   = your.server.com:51820
-#   AllowedIPs = 0.0.0.0/0, ::/0      # 全流量走 VPN
+#   PublicKey           = <server.pub 内容>
+#   Endpoint            = your.server.com:51820
+#   AllowedIPs          = 0.0.0.0/0, ::/0
 #   PersistentKeepalive = 25
-
+#
 [wireguard]
 listen         = "0.0.0.0:51820"
-private_key    = "SERVER_PRIVATE_KEY_BASE64"   # cat server.key
-server_address = ["10.0.0.1/24"]              # 服务端虚拟接口地址
-# mtu          = 1420                          # 默认 1420，一般无需修改
+private_key    = "SERVER_PRIVATE_KEY_BASE64"   # cat server.key 的输出
+server_address = ["10.0.0.1/24"]              # 服务端虚拟 IP/掩码
+# mtu          = 1420                          # 隧道 MTU，默认 1420
 
-# 客户端 #1
+# ── 客户端配置（每个客户端一个 [[wireguard.peers]] 块）──────────────────────
 [[wireguard.peers]]
-public_key          = "CLIENT1_PUBLIC_KEY_BASE64"  # cat client.pub
-allowed_ips         = ["10.0.0.2/32"]              # 该客户端的隧道内 IP
-# pre_shared_key    = "PSK_BASE64"                 # 可选：增强后量子安全性
-# keepalive_interval = 25                          # 秒；服务端主动 keepalive
+public_key  = "CLIENT1_PUBLIC_KEY_BASE64"      # cat client.pub 的输出
+allowed_ips = ["10.0.0.2/32"]                 # 该客户端在隧道内的 IP
+# pre_shared_key     = "PSK_BASE64"           # 可选：额外的预共享密钥（后量子增强）
+# keepalive_interval = 25                     # 秒；服务端主动发送 keepalive
 
-# 客户端 #2（多客户端时追加）
+# 追加更多客户端：
 # [[wireguard.peers]]
 # public_key  = "CLIENT2_PUBLIC_KEY_BASE64"
 # allowed_ips = ["10.0.0.3/32"]
-
-# ── Shadowsocks 2022 ──────────────────────────────────────────────────────────
-# 2022 加密协议使用 base64 编码的密钥作为密码（不再使用任意字符串）。
-# 生成密钥：
-#   aes-128: openssl rand -base64 16
-#   aes-256 / chacha20: openssl rand -base64 32
-#
-# [shadowsocks]
-# listen   = "0.0.0.0:8388"
-# password = "base64encodedkeyhere="   # 必须是 base64 编码的密钥
-# method   = "2022-blake3-aes-256-gcm" # 或 2022-blake3-aes-128-gcm / 2022-blake3-chacha20-poly1305
-
-# ── AnyTLS ────────────────────────────────────────────────────────────────────
-# AnyTLS 在单条 TLS 连接上多路复用多个 Stream，并通过 padding 混淆流量特征。
-# TLS 是必须的（AnyTLS 协议本身不提供加密，依赖 TLS 层）。
-#
-# [anytls]
-# listen   = "0.0.0.0:8443"
-# password = "your-strong-password"
-#
-# [anytls.tls]
-# cert_path = "/etc/ssl/certs/server.crt"
-# key_path  = "/etc/ssl/private/server.key"
-# # 或者使用自签名证书：
-# # self_signed_domain = "anytls.local"
-#
-# # 可选：自定义 padding 方案（留空则使用内置默认方案）
-# # padding_scheme = """
-# # stop=8
-# # 0=30-30
-# # 1=100-400
-# # """
