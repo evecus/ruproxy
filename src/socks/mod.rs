@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{bail, Result};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tracing::{debug, info, warn};
@@ -169,9 +169,6 @@ async fn send_reply<W: AsyncWrite + Unpin>(w: &mut W, rep: u8) -> Result<()> {
         .await?;
     Ok(())
 }
-
-trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 async fn relay(inbound: TcpStream, outbound: TcpStream) -> Result<()> {
     let (mut ir, mut iw) = inbound.into_split();
