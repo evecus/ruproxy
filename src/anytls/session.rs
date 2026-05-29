@@ -28,16 +28,16 @@ use super::padding::SharedPadding;
 
 // ── Command constants ─────────────────────────────────────────────────────────
 
-const CMD_WASTE: u8           = 0;
-const CMD_SYN: u8             = 1;
-const CMD_PSH: u8             = 2;
-const CMD_FIN: u8             = 3;
-const CMD_SETTINGS: u8        = 4;
-const CMD_ALERT: u8           = 5;
-const CMD_UPDATE_PADDING: u8  = 6;
-const CMD_SYNACK: u8          = 7;
-const CMD_HEART_REQUEST: u8   = 8;
-const CMD_HEART_RESPONSE: u8  = 9;
+const CMD_WASTE: u8 = 0;
+const CMD_SYN: u8 = 1;
+const CMD_PSH: u8 = 2;
+const CMD_FIN: u8 = 3;
+const CMD_SETTINGS: u8 = 4;
+const CMD_ALERT: u8 = 5;
+const CMD_UPDATE_PADDING: u8 = 6;
+const CMD_SYNACK: u8 = 7;
+const CMD_HEART_REQUEST: u8 = 8;
+const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
 
 const HEADER_SIZE: usize = 7; // CMD(1) + SID(4) + LEN(2)
@@ -161,8 +161,8 @@ where
             }
         }
 
-        let cmd  = hdr[0];
-        let sid  = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
+        let cmd = hdr[0];
+        let sid = u32::from_be_bytes(hdr[1..5].try_into().unwrap());
         let dlen = u16::from_be_bytes(hdr[5..7].try_into().unwrap()) as usize;
 
         let data = if dlen > 0 {
@@ -192,10 +192,15 @@ where
                 }
 
                 // Check padding-md5; send update if mismatch
-                let client_md5 = settings.get("padding-md5").map(|s| s.as_str()).unwrap_or("");
+                let client_md5 = settings
+                    .get("padding-md5")
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
                 let scheme = padding.get();
                 if client_md5 != scheme.md5_hex {
-                    let _ = write_tx.send((CMD_UPDATE_PADDING, 0, scheme.raw.clone())).await;
+                    let _ = write_tx
+                        .send((CMD_UPDATE_PADDING, 0, scheme.raw.clone()))
+                        .await;
                 }
 
                 // If client is v2+, reply with cmdServerSettings

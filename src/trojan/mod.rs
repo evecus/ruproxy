@@ -57,9 +57,7 @@ async fn handle(
     let mut io: Box<dyn AsyncReadWrite> = match (transport, tls_acceptor) {
         ("tcp", None) => Box::new(stream),
         ("tcp", Some(acc)) => Box::new(acc.accept(stream).await?),
-        ("ws", None) => Box::new(
-            shared_ws::accept_plain(stream, ws_path, ws_host).await?,
-        ),
+        ("ws", None) => Box::new(shared_ws::accept_plain(stream, ws_path, ws_host).await?),
         ("ws", Some(acc)) => {
             let tls = acc.accept(stream).await?;
             Box::new(shared_ws::accept_tls(tls, ws_path, ws_host).await?)

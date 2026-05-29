@@ -45,7 +45,7 @@ use smoltcp::{
     iface::SocketHandle,
     socket::{
         tcp::{Socket as TcpSocket, SocketBuffer, State as TcpState},
-        udp::{Socket as UdpSocket, PacketBuffer, PacketMetadata, UdpMetadata},
+        udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata},
     },
     wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address},
 };
@@ -63,13 +63,13 @@ use crate::wireguard::iface::VirtualIface;
 
 const TCP_RX_BUF: usize = 128 * 1024;
 const TCP_TX_BUF: usize = 128 * 1024;
-const UDP_QUEUE:  usize = 64;
-const UDP_BUF:    usize = 64 * 1024;
+const UDP_QUEUE: usize = 64;
+const UDP_BUF: usize = 64 * 1024;
 
 // ── 公开类型 ──────────────────────────────────────────────────────────────────
 
 /// 外部向 actor 推送明文入站 IP 包。
-pub type StackTx  = mpsc::Sender<Vec<u8>>;
+pub type StackTx = mpsc::Sender<Vec<u8>>;
 /// Actor 向外推送需要加密回传的 IP 包。
 pub type EncryptTx = mpsc::Sender<Vec<u8>>;
 
@@ -90,21 +90,21 @@ enum Msg {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FlowKey {
-    proto:    u8,
-    src:      SocketAddr,
-    dst:      SocketAddr,
+    proto: u8,
+    src: SocketAddr,
+    dst: SocketAddr,
 }
 
 struct TcpFlow {
-    handle:        SocketHandle,
+    handle: SocketHandle,
     /// smoltcp recv buf → 真实远端写入通道。
-    outbound_tx:   mpsc::Sender<Vec<u8>>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
     relay_started: bool,
-    last_active:   Instant,
+    last_active: Instant,
 }
 
 struct UdpFlow {
-    handle:      SocketHandle,
+    handle: SocketHandle,
     /// 向真实远端发送的通道（由 udp relay task 消费）。
     outbound_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
     last_active: Instant,
@@ -114,7 +114,6 @@ struct UdpFlow {
 
 /// 启动 per-peer smoltcp actor，返回 StackTx 供调用方推包。
 pub fn spawn_stack(local_addrs: Vec<IpCidr>, encrypt_tx: EncryptTx) -> StackTx {
-
     // 外部推入明文 IP 包的通道。
     let (stack_tx, stack_rx) = mpsc::channel::<Vec<u8>>(512);
 
@@ -127,7 +126,9 @@ pub fn spawn_stack(local_addrs: Vec<IpCidr>, encrypt_tx: EncryptTx) -> StackTx {
         let mut rx = stack_rx;
         tokio::spawn(async move {
             while let Some(pkt) = rx.recv().await {
-                if fwd.send(Msg::Inbound(pkt)).await.is_err() { break; }
+                if fwd.send(Msg::Inbound(pkt)).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -139,7 +140,9 @@ pub fn spawn_stack(local_addrs: Vec<IpCidr>, encrypt_tx: EncryptTx) -> StackTx {
             let mut tick = time::interval(Duration::from_millis(100));
             loop {
                 tick.tick().await;
-                if fwd.send(Msg::Tick).await.is_err() { break; }
+                if fwd.send(Msg::Tick).await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -154,25 +157,24 @@ pub fn spawn_stack(local_addrs: Vec<IpCidr>, encrypt_tx: EncryptTx) -> StackTx {
 
 async fn run_actor(
     local_addrs: Vec<IpCidr>,
-    encrypt_tx:  EncryptTx,
-    actor_tx:    mpsc::Sender<Msg>,
+    encrypt_tx: EncryptTx,
+    actor_tx: mpsc::Sender<Msg>,
     mut actor_rx: mpsc::Receiver<Msg>,
 ) {
-    let mut iface     = VirtualIface::new(&local_addrs);
+    let mut iface = VirtualIface::new(&local_addrs);
     let mut tcp_flows: HashMap<FlowKey, TcpFlow> = HashMap::new();
     let mut udp_flows: HashMap<FlowKey, UdpFlow> = HashMap::new();
 
     while let Some(msg) = actor_rx.recv().await {
         match msg {
-
             // ── 入站 IP 包 ────────────────────────────────────────────────────
             Msg::Inbound(pkt) => {
                 // 1. 解析流 key，按需建 smoltcp socket。
                 if let Some(key) = parse_flow_key(&pkt) {
                     match key.proto {
-                        6  => ensure_tcp(&mut iface, &mut tcp_flows, &key),
+                        6 => ensure_tcp(&mut iface, &mut tcp_flows, &key),
                         17 => ensure_udp(&mut iface, &mut udp_flows, &key, &actor_tx),
-                        _  => {}
+                        _ => {}
                     }
                 }
 
@@ -200,7 +202,8 @@ async fn run_actor(
             // ── 真实远端 UDP 回包 → smoltcp UDP 发送缓冲区 ───────────────────
             Msg::UdpReply { handle, data } => {
                 // 找原始 src（peer 的隧道内 IP）作为 smoltcp UDP 目标端点。
-                let peer_ep = udp_flows.iter()
+                let peer_ep = udp_flows
+                    .iter()
                     .find(|(_, f)| f.handle == handle)
                     .map(|(k, _)| k.src);
                 if let Some(peer_ep) = peer_ep {
@@ -225,12 +228,10 @@ async fn run_actor(
 
 // ── Socket 创建 ───────────────────────────────────────────────────────────────
 
-fn ensure_tcp(
-    iface:     &mut VirtualIface,
-    tcp_flows: &mut HashMap<FlowKey, TcpFlow>,
-    key:       &FlowKey,
-) {
-    if tcp_flows.contains_key(key) { return; }
+fn ensure_tcp(iface: &mut VirtualIface, tcp_flows: &mut HashMap<FlowKey, TcpFlow>, key: &FlowKey) {
+    if tcp_flows.contains_key(key) {
+        return;
+    }
 
     let rx = SocketBuffer::new(vec![0u8; TCP_RX_BUF]);
     let tx = SocketBuffer::new(vec![0u8; TCP_TX_BUF]);
@@ -250,31 +251,30 @@ fn ensure_tcp(
     let handle = iface.sockets.add(sock);
     // outbound_tx 先用一个 dummy sender；relay 启动时再换真实的。
     let (outbound_tx, _rx) = mpsc::channel::<Vec<u8>>(1);
-    tcp_flows.insert(key.clone(), TcpFlow {
-        handle,
-        outbound_tx,
-        relay_started: false,
-        last_active: Instant::now(),
-    });
+    tcp_flows.insert(
+        key.clone(),
+        TcpFlow {
+            handle,
+            outbound_tx,
+            relay_started: false,
+            last_active: Instant::now(),
+        },
+    );
     debug!("[wg/stack] TCP socket created for {:?}", key.dst);
 }
 
 fn ensure_udp(
-    iface:     &mut VirtualIface,
+    iface: &mut VirtualIface,
     udp_flows: &mut HashMap<FlowKey, UdpFlow>,
-    key:       &FlowKey,
-    actor_tx:  &mpsc::Sender<Msg>,
+    key: &FlowKey,
+    actor_tx: &mpsc::Sender<Msg>,
 ) {
-    if udp_flows.contains_key(key) { return; }
+    if udp_flows.contains_key(key) {
+        return;
+    }
 
-    let rx = PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; UDP_QUEUE],
-        vec![0u8; UDP_BUF],
-    );
-    let tx = PacketBuffer::new(
-        vec![PacketMetadata::EMPTY; UDP_QUEUE],
-        vec![0u8; UDP_BUF],
-    );
+    let rx = PacketBuffer::new(vec![PacketMetadata::EMPTY; UDP_QUEUE], vec![0u8; UDP_BUF]);
+    let tx = PacketBuffer::new(vec![PacketMetadata::EMPTY; UDP_QUEUE], vec![0u8; UDP_BUF]);
     let mut sock = UdpSocket::new(rx, tx);
     let ep = IpListenEndpoint {
         addr: Some(ip_to_smoltcp(key.dst.ip())),
@@ -291,31 +291,30 @@ fn ensure_udp(
     let (outbound_tx, outbound_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(128);
     spawn_udp_relay(handle, outbound_rx, actor_tx.clone());
 
-    udp_flows.insert(key.clone(), UdpFlow {
-        handle,
-        outbound_tx,
-        last_active: Instant::now(),
-    });
+    udp_flows.insert(
+        key.clone(),
+        UdpFlow {
+            handle,
+            outbound_tx,
+            last_active: Instant::now(),
+        },
+    );
     debug!("[wg/stack] UDP socket created for {:?}", key.dst);
 }
 
 // ── TCP relay 启动 ────────────────────────────────────────────────────────────
 
 async fn start_tcp_relays(
-    iface:     &mut VirtualIface,
+    iface: &mut VirtualIface,
     tcp_flows: &mut HashMap<FlowKey, TcpFlow>,
-    actor_tx:  &mpsc::Sender<Msg>,
+    actor_tx: &mpsc::Sender<Msg>,
 ) {
     // 收集需要启动 relay 的 (key, handle, dst)。
     let to_start: Vec<(FlowKey, SocketHandle, SocketAddr)> = tcp_flows
         .iter()
         .filter(|(_, f)| {
             !f.relay_started
-                && iface
-                    .sockets
-                    .get::<TcpSocket>(f.handle)
-                    .state()
-                    == TcpState::Established
+                && iface.sockets.get::<TcpSocket>(f.handle).state() == TcpState::Established
         })
         .map(|(k, f)| (k.clone(), f.handle, k.dst))
         .collect();
@@ -339,10 +338,10 @@ async fn start_tcp_relays(
 ///  real stream read  ──TcpData msg──►  smoltcp send buf    (fwd)
 /// ```
 fn spawn_tcp_relay(
-    handle:      SocketHandle,
-    dst:         SocketAddr,
+    handle: SocketHandle,
+    dst: SocketAddr,
     outbound_rx: mpsc::Receiver<Vec<u8>>,
-    actor_tx:    mpsc::Sender<Msg>,
+    actor_tx: mpsc::Sender<Msg>,
 ) {
     tokio::spawn(async move {
         match TcpStream::connect(dst).await {
@@ -394,14 +393,15 @@ fn spawn_tcp_relay(
 
 // ── smoltcp recv buf 排空 ─────────────────────────────────────────────────────
 
-async fn drain_tcp_recv(
-    iface:     &mut VirtualIface,
-    tcp_flows: &mut HashMap<FlowKey, TcpFlow>,
-) {
+async fn drain_tcp_recv(iface: &mut VirtualIface, tcp_flows: &mut HashMap<FlowKey, TcpFlow>) {
     for flow in tcp_flows.values_mut() {
-        if !flow.relay_started { continue; }
+        if !flow.relay_started {
+            continue;
+        }
         let sock = iface.sockets.get_mut::<TcpSocket>(flow.handle);
-        if !sock.may_recv() || sock.recv_queue() == 0 { continue; }
+        if !sock.may_recv() || sock.recv_queue() == 0 {
+            continue;
+        }
 
         let mut buf = vec![0u8; sock.recv_queue()];
         match sock.recv_slice(&mut buf) {
@@ -415,18 +415,13 @@ async fn drain_tcp_recv(
     }
 }
 
-async fn drain_udp_recv(
-    iface:     &mut VirtualIface,
-    udp_flows: &mut HashMap<FlowKey, UdpFlow>,
-) {
+async fn drain_udp_recv(iface: &mut VirtualIface, udp_flows: &mut HashMap<FlowKey, UdpFlow>) {
     for (key, flow) in udp_flows.iter_mut() {
         let sock = iface.sockets.get_mut::<UdpSocket>(flow.handle);
         while sock.can_recv() {
             match sock.recv() {
                 Ok((data, _meta)) => {
-                    let _ = flow.outbound_tx
-                        .send((key.dst, data.to_vec()))
-                        .await;
+                    let _ = flow.outbound_tx.send((key.dst, data.to_vec())).await;
                     flow.last_active = Instant::now();
                 }
                 Err(_) => break,
@@ -446,12 +441,7 @@ fn feed_tcp_send(iface: &mut VirtualIface, handle: SocketHandle, data: &[u8]) {
     }
 }
 
-fn feed_udp_send(
-    iface:   &mut VirtualIface,
-    handle:  SocketHandle,
-    peer_ep: SocketAddr,
-    data:    &[u8],
-) {
+fn feed_udp_send(iface: &mut VirtualIface, handle: SocketHandle, peer_ep: SocketAddr, data: &[u8]) {
     let sock = iface.sockets.get_mut::<UdpSocket>(handle);
     let meta = UdpMetadata {
         endpoint: sock_to_smoltcp(peer_ep),
@@ -467,9 +457,9 @@ fn feed_udp_send(
 /// 从 outbound_rx 接收 (dst, payload)，用真实 UdpSocket 发出去，
 /// 收到回包后通过 actor_tx 发 UdpReply 回 actor。
 fn spawn_udp_relay(
-    handle:      SocketHandle,
+    handle: SocketHandle,
     mut outbound_rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
-    actor_tx:    mpsc::Sender<Msg>,
+    actor_tx: mpsc::Sender<Msg>,
 ) {
     tokio::spawn(async move {
         // 惰性绑定：等第一个包到才决定 IPv4/IPv6。
@@ -480,13 +470,18 @@ fn spawn_udp_relay(
 
         loop {
             // 等待下一个出站 datagram。
-            let Some((dst, payload)) = outbound_rx.recv().await else { break };
+            let Some((dst, payload)) = outbound_rx.recv().await else {
+                break;
+            };
 
             let sock = if dst.is_ipv4() {
                 if sock4.is_none() {
                     match TokioUdp::bind("0.0.0.0:0").await {
                         Ok(s) => sock4 = Some(Arc::new(s)),
-                        Err(e) => { warn!("[wg/stack] UDP bind v4: {e}"); continue; }
+                        Err(e) => {
+                            warn!("[wg/stack] UDP bind v4: {e}");
+                            continue;
+                        }
                     }
                 }
                 sock4.as_ref().unwrap().clone()
@@ -494,7 +489,10 @@ fn spawn_udp_relay(
                 if sock6.is_none() {
                     match TokioUdp::bind("[::]:0").await {
                         Ok(s) => sock6 = Some(Arc::new(s)),
-                        Err(e) => { warn!("[wg/stack] UDP bind v6: {e}"); continue; }
+                        Err(e) => {
+                            warn!("[wg/stack] UDP bind v6: {e}");
+                            continue;
+                        }
                     }
                 }
                 sock6.as_ref().unwrap().clone()
@@ -506,11 +504,15 @@ fn spawn_udp_relay(
             }
 
             // 以 1 s 超时等回包（DNS 等协议单次交互）。
-            if let Ok(Ok((n, _from))) = time::timeout(Duration::from_secs(1), sock.recv_from(&mut reply_buf)).await {
-                let _ = actor_tx.send(Msg::UdpReply {
-                    handle,
-                    data: reply_buf[..n].to_vec(),
-                }).await;
+            if let Ok(Ok((n, _from))) =
+                time::timeout(Duration::from_secs(1), sock.recv_from(&mut reply_buf)).await
+            {
+                let _ = actor_tx
+                    .send(Msg::UdpReply {
+                        handle,
+                        data: reply_buf[..n].to_vec(),
+                    })
+                    .await;
             }
         }
     });
@@ -519,7 +521,7 @@ fn spawn_udp_relay(
 // ── 流淘汰 ────────────────────────────────────────────────────────────────────
 
 fn evict_flows(
-    iface:     &mut VirtualIface,
+    iface: &mut VirtualIface,
     tcp_flows: &mut HashMap<FlowKey, TcpFlow>,
     udp_flows: &mut HashMap<FlowKey, UdpFlow>,
 ) {
@@ -529,12 +531,16 @@ fn evict_flows(
 
     tcp_flows.retain(|_, f| {
         let keep = now.duration_since(f.last_active) < TCP_IDLE;
-        if !keep { iface.sockets.remove(f.handle); }
+        if !keep {
+            iface.sockets.remove(f.handle);
+        }
         keep
     });
     udp_flows.retain(|_, f| {
         let keep = now.duration_since(f.last_active) < UDP_IDLE;
-        if !keep { iface.sockets.remove(f.handle); }
+        if !keep {
+            iface.sockets.remove(f.handle);
+        }
         keep
     });
 }
@@ -556,10 +562,14 @@ fn parse_flow_key(pkt: &[u8]) -> Option<FlowKey> {
 }
 
 fn parse_ipv4_flow(pkt: &[u8]) -> Option<FlowKey> {
-    if pkt.len() < 20 { return None; }
+    if pkt.len() < 20 {
+        return None;
+    }
     let ihl = ((pkt[0] & 0x0f) as usize) * 4;
     let proto = pkt[9];
-    if proto != 6 && proto != 17 { return None; }
+    if proto != 6 && proto != 17 {
+        return None;
+    }
     let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
     let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
     let t = pkt.get(ihl..ihl + 4)?;
@@ -571,9 +581,13 @@ fn parse_ipv4_flow(pkt: &[u8]) -> Option<FlowKey> {
 }
 
 fn parse_ipv6_flow(pkt: &[u8]) -> Option<FlowKey> {
-    if pkt.len() < 44 { return None; }
+    if pkt.len() < 44 {
+        return None;
+    }
     let proto = pkt[6];
-    if proto != 6 && proto != 17 { return None; }
+    if proto != 6 && proto != 17 {
+        return None;
+    }
     let src_ip = ipv6_from_slice(&pkt[8..24]);
     let dst_ip = ipv6_from_slice(&pkt[24..40]);
     let t = pkt.get(40..44)?;

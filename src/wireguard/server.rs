@@ -81,8 +81,7 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
 
     for (idx, peer_cfg) in cfg.peers.iter().enumerate() {
         let pub_bytes = decode_key(&peer_cfg.public_key, "peer public_key")?;
-        let pub_key =
-            x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(pub_bytes.as_slice())?);
+        let pub_key = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(pub_bytes.as_slice())?);
 
         let psk: Option<[u8; 32]> = match &peer_cfg.pre_shared_key {
             Some(s) => {
@@ -130,23 +129,28 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
         );
     }
 
-    let peer_map  = Arc::new(peer_map);
+    let peer_map = Arc::new(peer_map);
     let stack_txs = Arc::new(stack_txs);
 
     // ── 绑定 UDP 套接字 ───────────────────────────────────────────────────────
     let listen_addr: SocketAddr = cfg.listen.parse()?;
     let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
-    info!("[wireguard] listening on {listen_addr} ({} peers)", cfg.peers.len());
+    info!(
+        "[wireguard] listening on {listen_addr} ({} peers)",
+        cfg.peers.len()
+    );
 
     // ── 加密回传任务（每 peer 一个）────────────────────────────────────────────
     // smoltcp actor 产生明文 IP 包 → boringtun 加密 → 发回 peer。
     for (pub_hex, mut enc_rx) in encrypt_rxs {
         let socket_enc = Arc::clone(&socket);
-        let peers_enc  = Arc::clone(&peer_map);
+        let peers_enc = Arc::clone(&peer_map);
         tokio::spawn(async move {
             let mut enc_buf = vec![0u8; MAX_PACKET];
             while let Some(ip_pkt) = enc_rx.recv().await {
-                let Some(peer) = peers_enc.get(&pub_hex) else { continue };
+                let Some(peer) = peers_enc.get(&pub_hex) else {
+                    continue;
+                };
                 let ep = *peer.endpoint.lock().await;
                 let Some(ep) = ep else { continue };
 
@@ -161,10 +165,10 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
     // ── 定时器任务：驱动 boringtun keepalive / 重握手 ────────────────────────
     {
         let socket_timer = Arc::clone(&socket);
-        let peers_timer  = Arc::clone(&peer_map);
+        let peers_timer = Arc::clone(&peer_map);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(TIMER_TICK_MS));
-            let mut buf  = vec![0u8; MAX_PACKET];
+            let mut buf = vec![0u8; MAX_PACKET];
             loop {
                 tick.tick().await;
                 for peer in peers_timer.values() {
@@ -191,7 +195,7 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
 
     // ── 主接收循环 ────────────────────────────────────────────────────────────
     let mut recv_buf = vec![0u8; MAX_PACKET];
-    let mut dec_buf  = vec![0u8; MAX_PACKET];
+    let mut dec_buf = vec![0u8; MAX_PACKET];
 
     loop {
         let (n, src) = socket.recv_from(&mut recv_buf).await?;
@@ -222,7 +226,7 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
                     None
                 }
                 TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
-                    Some(pkt.to_vec())  // 立即复制，释放 dec_buf 借用
+                    Some(pkt.to_vec()) // 立即复制，释放 dec_buf 借用
                 }
                 TunnResult::Done => None,
                 TunnResult::Err(e) => {
@@ -261,8 +265,8 @@ pub async fn run(cfg: Arc<WireGuardConfig>) -> Result<()> {
 ///   未来可解析 msg type=1/2 做精确匹配）。
 async fn find_peer(
     peers: &HashMap<String, Arc<Peer>>,
-    _raw:  &[u8],
-    src:   SocketAddr,
+    _raw: &[u8],
+    src: SocketAddr,
 ) -> Option<(String, Arc<Peer>)> {
     for (hex, peer) in peers {
         if *peer.endpoint.lock().await == Some(src) {
@@ -274,17 +278,14 @@ async fn find_peer(
 }
 
 /// 排空 boringtun 定时器产生的出站包（keepalive、重握手等）。
-async fn drain_timers(
-    peer:   &Arc<Peer>,
-    socket: &UdpSocket,
-    dst:    SocketAddr,
-    buf:    &mut [u8],
-) {
+async fn drain_timers(peer: &Arc<Peer>, socket: &UdpSocket, dst: SocketAddr, buf: &mut [u8]) {
     let mut tun = peer.tunnel.lock().await;
     loop {
         match tun.update_timers(buf) {
-            TunnResult::WriteToNetwork(pkt) => { let _ = socket.send_to(pkt, dst).await; }
-            TunnResult::Done  => break,
+            TunnResult::WriteToNetwork(pkt) => {
+                let _ = socket.send_to(pkt, dst).await;
+            }
+            TunnResult::Done => break,
             TunnResult::Err(_) => break,
             _ => break,
         }
@@ -294,33 +295,37 @@ async fn drain_timers(
 /// 从原始 IP 包头提取源地址（用于 AllowedIPs 检查）。
 fn packet_src_ip(pkt: &[u8]) -> IpAddr {
     match pkt.first().map(|b| b >> 4) {
-        Some(4) if pkt.len() >= 20 =>
-            IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])),
-        Some(6) if pkt.len() >= 40 =>
-            IpAddr::V6(ipv6_from_slice(&pkt[8..24])),
+        Some(4) if pkt.len() >= 20 => IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])),
+        Some(6) if pkt.len() >= 40 => IpAddr::V6(ipv6_from_slice(&pkt[8..24])),
         _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     }
 }
 
 fn ipv6_from_slice(b: &[u8]) -> Ipv6Addr {
     let mut a = [0u16; 8];
-    for i in 0..8 { a[i] = u16::from_be_bytes([b[i*2], b[i*2+1]]); }
+    for i in 0..8 {
+        a[i] = u16::from_be_bytes([b[i * 2], b[i * 2 + 1]]);
+    }
     Ipv6Addr::new(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7])
 }
 
 fn decode_key(b64: &str, label: &str) -> Result<Vec<u8>> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    STANDARD.decode(b64.trim())
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    STANDARD
+        .decode(b64.trim())
         .with_context(|| format!("invalid base64 for {label}"))
 }
 
 fn parse_ip_cidr(s: &str) -> Result<IpCidr> {
-    let (ip_str, plen) = s.rsplit_once('/')
+    let (ip_str, plen) = s
+        .rsplit_once('/')
         .ok_or_else(|| anyhow::anyhow!("invalid CIDR: {s}"))?;
     let plen: u8 = plen.parse()?;
     let ip: IpAddr = ip_str.parse()?;
     Ok(match ip {
         IpAddr::V4(v4) => IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address(v4.octets()), plen)),
-        IpAddr::V6(v6) => IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(Ipv6Address(v6.octets()), plen)),
+        IpAddr::V6(v6) => {
+            IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(Ipv6Address(v6.octets()), plen))
+        }
     })
 }

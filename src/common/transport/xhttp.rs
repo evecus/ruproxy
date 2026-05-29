@@ -115,10 +115,8 @@ where
                 let host = host.clone();
 
                 async move {
-                    let resp = handle_request(
-                        req, &path, &host, &up_tx, &down_rx, &ready_tx, peer,
-                    )
-                    .await;
+                    let resp =
+                        handle_request(req, &path, &host, &up_tx, &down_rx, &ready_tx, peer).await;
                     Ok::<_, std::convert::Infallible>(resp)
                 }
             });
@@ -272,9 +270,7 @@ impl http_body::Body for ResponseBody {
             ResponseBody::Stream(rx) => match rx.poll_recv(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => Poll::Ready(None),
-                Poll::Ready(Some(data)) => {
-                    Poll::Ready(Some(Ok(http_body::Frame::data(data))))
-                }
+                Poll::Ready(Some(data)) => Poll::Ready(Some(Ok(http_body::Frame::data(data)))),
             },
         }
     }

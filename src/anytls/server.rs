@@ -54,9 +54,9 @@ pub async fn run(cfg: Arc<AnyTlsConfig>) -> Result<()> {
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let acc      = Arc::clone(&tls_acceptor);
-        let pw_hash  = Arc::clone(&password_hash);
-        let pad      = Arc::clone(&padding);
+        let acc = Arc::clone(&tls_acceptor);
+        let pw_hash = Arc::clone(&password_hash);
+        let pad = Arc::clone(&padding);
 
         tokio::spawn(async move {
             debug!("[anytls] new connection from {peer}");
@@ -96,11 +96,9 @@ async fn handle_conn(
 
     // ── Session loop ────────────────────────────────────────────────────────
     let pad_clone = (*padding).clone();
-    run_server_session(conn, pad_clone, move |stream_conn| {
-        async move {
-            if let Err(e) = handle_stream(stream_conn, peer).await {
-                debug!("[anytls] stream error {peer}: {e:#}");
-            }
+    run_server_session(conn, pad_clone, move |stream_conn| async move {
+        if let Err(e) = handle_stream(stream_conn, peer).await {
+            debug!("[anytls] stream error {peer}: {e:#}");
         }
     })
     .await?;

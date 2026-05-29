@@ -62,7 +62,12 @@ impl PaddingScheme {
             h.update(raw);
             format!("{:x}", h.finalize())
         };
-        Some(PaddingScheme { stop, rules, raw: raw.to_vec(), md5_hex })
+        Some(PaddingScheme {
+            stop,
+            rules,
+            raw: raw.to_vec(),
+            md5_hex,
+        })
     }
 
     /// Generate TLS record payload sizes for packet index `pkt`.
@@ -80,8 +85,14 @@ fn parse_size_list(s: &str) -> Vec<i64> {
         if part == "c" {
             out.push(CHECK_MARK);
         } else if let Some((lo_s, hi_s)) = part.split_once('-') {
-            let lo: i64 = match lo_s.parse() { Ok(v) => v, Err(_) => continue };
-            let hi: i64 = match hi_s.parse() { Ok(v) => v, Err(_) => continue };
+            let lo: i64 = match lo_s.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let hi: i64 = match hi_s.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             if lo <= 0 || hi <= 0 {
                 continue;
             }

@@ -13,10 +13,9 @@ use crate::common::transport::websocket as shared_ws;
 use crate::common::transport::xhttp::{self, XhttpConfig};
 use crate::config::ShadowsocksConfig;
 use crate::shadowsocks::protocol::{
-    build_response_header, decode_master_key, derive_session_subkey,
-    parse_request_header, AeadReader, AeadWriter, STREAM_TYPE_REQUEST,
+    build_response_header, decode_master_key, derive_session_subkey, parse_request_header,
+    AeadReader, AeadWriter, STREAM_TYPE_REQUEST,
 };
-
 
 pub async fn run(cfg: Arc<ShadowsocksConfig>) -> Result<()> {
     let key_len = cfg.method.key_len();
@@ -86,13 +85,19 @@ async fn handle_conn(
             process(ws, peer, cfg, master_key).await
         }
         ("xhttp", None) => {
-            let xh_cfg = XhttpConfig { path: xh_path.to_string(), host: xh_host };
+            let xh_cfg = XhttpConfig {
+                path: xh_path.to_string(),
+                host: xh_host,
+            };
             let xh = xhttp::accept_plain(stream, peer, &xh_cfg).await?;
             process(xh, peer, cfg, master_key).await
         }
         ("xhttp", Some(acc)) => {
             let tls = acc.accept(stream).await?;
-            let xh_cfg = XhttpConfig { path: xh_path.to_string(), host: xh_host };
+            let xh_cfg = XhttpConfig {
+                path: xh_path.to_string(),
+                host: xh_host,
+            };
             let xh = xhttp::accept_tls(tls, peer, &xh_cfg).await?;
             process(xh, peer, cfg, master_key).await
         }
@@ -163,7 +168,10 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n]).await.is_err() {
+            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n])
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -179,8 +187,12 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if aead_w.write_data(&tmp[..n]).await.is_err() { break; }
-            if aead_w.flush().await.is_err() { break; }
+            if aead_w.write_data(&tmp[..n]).await.is_err() {
+                break;
+            }
+            if aead_w.flush().await.is_err() {
+                break;
+            }
         }
         debug!("[shadowsocks] downlink closed {t2}→{peer}");
     };

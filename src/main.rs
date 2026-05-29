@@ -78,7 +78,10 @@ async fn main() -> Result<()> {
             Some(crate::config::VlessTlsConfig::Tls { .. }) => "tls",
             Some(crate::config::VlessTlsConfig::Reality(_)) => "reality",
         };
-        info!("[vless] transport={}, tls={tls_label}", vless_cfg.transport.r#type);
+        info!(
+            "[vless] transport={}, tls={tls_label}",
+            vless_cfg.transport.r#type
+        );
         let h = tokio::spawn(async move {
             if let Err(e) = vless::listener::run(vless_cfg).await {
                 tracing::error!("[vless] server exited with error: {e:#}");
@@ -167,8 +170,15 @@ async fn main() -> Result<()> {
     // ── SOCKS5 ────────────────────────────────────────────────────────────────
     if let Some(socks_cfg) = cfg.socks.clone() {
         let socks_cfg = Arc::new(socks_cfg);
-        let auth_label = if socks_cfg.users.is_empty() { "no-auth" } else { "password" };
-        info!("[socks5] enabled, listen: {}, auth={auth_label}", socks_cfg.listen);
+        let auth_label = if socks_cfg.users.is_empty() {
+            "no-auth"
+        } else {
+            "password"
+        };
+        info!(
+            "[socks5] enabled, listen: {}, auth={auth_label}",
+            socks_cfg.listen
+        );
         let h = tokio::spawn(async move {
             if let Err(e) = socks::run(socks_cfg).await {
                 tracing::error!("[socks5] server exited with error: {e:#}");

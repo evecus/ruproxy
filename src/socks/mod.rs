@@ -39,7 +39,11 @@ const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 pub async fn run(cfg: Arc<SocksConfig>) -> Result<()> {
     let addr: SocketAddr = cfg.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;
-    let auth_label = if cfg.users.is_empty() { "none" } else { "password" };
+    let auth_label = if cfg.users.is_empty() {
+        "none"
+    } else {
+        "password"
+    };
     info!("[socks5] Listening on {addr} (auth={auth_label})");
 
     loop {

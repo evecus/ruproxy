@@ -26,7 +26,7 @@
 //! the counter is incremented per-chunk).
 
 use anyhow::{bail, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,8 +74,9 @@ pub fn derive_session_subkey(master_key: &[u8], salt: &[u8], key_len: usize) -> 
 /// Decode the base64 password into raw key bytes for 2022 ciphers.
 /// The password IS the key (no EVP_BytesToKey).
 pub fn decode_master_key(password: &str, key_len: usize) -> Result<Vec<u8>> {
-    let key = BASE64.decode(password.trim())
-        .map_err(|e| anyhow::anyhow!("shadowsocks 2022: password must be base64-encoded key: {e}"))?;
+    let key = BASE64.decode(password.trim()).map_err(|e| {
+        anyhow::anyhow!("shadowsocks 2022: password must be base64-encoded key: {e}")
+    })?;
     if key.len() != key_len {
         bail!(
             "shadowsocks 2022: key length mismatch: expected {} bytes, got {} bytes (check cipher and password)",
@@ -105,28 +106,44 @@ pub fn check_timestamp(ts: u64) -> Result<()> {
 
 // ── AEAD helpers ──────────────────────────────────────────────────────────────
 
-pub fn aead_encrypt(cipher: &ShadowsocksCipher, key: &[u8], nonce: &[u8; 12], pt: &[u8]) -> Result<Vec<u8>> {
+pub fn aead_encrypt(
+    cipher: &ShadowsocksCipher,
+    key: &[u8],
+    nonce: &[u8; 12],
+    pt: &[u8],
+) -> Result<Vec<u8>> {
     let n = GenericArray::from_slice(nonce);
     let r = match cipher {
-        ShadowsocksCipher::Blake3Aes128Gcm =>
-            Aes128Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.encrypt(n, pt),
-        ShadowsocksCipher::Blake3Aes256Gcm =>
-            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.encrypt(n, pt),
-        ShadowsocksCipher::Blake3Chacha20Poly1305 =>
-            ChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.encrypt(n, pt),
+        ShadowsocksCipher::Blake3Aes128Gcm => Aes128Gcm::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .encrypt(n, pt),
+        ShadowsocksCipher::Blake3Aes256Gcm => Aes256Gcm::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .encrypt(n, pt),
+        ShadowsocksCipher::Blake3Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .encrypt(n, pt),
     };
     r.map_err(|_| anyhow::anyhow!("AEAD encrypt failed"))
 }
 
-pub fn aead_decrypt(cipher: &ShadowsocksCipher, key: &[u8], nonce: &[u8; 12], ct: &[u8]) -> Result<Vec<u8>> {
+pub fn aead_decrypt(
+    cipher: &ShadowsocksCipher,
+    key: &[u8],
+    nonce: &[u8; 12],
+    ct: &[u8],
+) -> Result<Vec<u8>> {
     let n = GenericArray::from_slice(nonce);
     let r = match cipher {
-        ShadowsocksCipher::Blake3Aes128Gcm =>
-            Aes128Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.decrypt(n, ct),
-        ShadowsocksCipher::Blake3Aes256Gcm =>
-            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.decrypt(n, ct),
-        ShadowsocksCipher::Blake3Chacha20Poly1305 =>
-            ChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow::anyhow!("{e}"))?.decrypt(n, ct),
+        ShadowsocksCipher::Blake3Aes128Gcm => Aes128Gcm::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .decrypt(n, ct),
+        ShadowsocksCipher::Blake3Aes256Gcm => Aes256Gcm::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .decrypt(n, ct),
+        ShadowsocksCipher::Blake3Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .decrypt(n, ct),
     };
     r.map_err(|_| anyhow::anyhow!("AEAD decrypt failed"))
 }
@@ -135,15 +152,17 @@ pub fn aead_decrypt(cipher: &ShadowsocksCipher, key: &[u8], nonce: &[u8; 12], ct
 pub fn increment_nonce(n: &mut [u8; 12]) {
     for b in n.iter_mut() {
         *b = b.wrapping_add(1);
-        if *b != 0 { break; }
+        if *b != 0 {
+            break;
+        }
     }
 }
 
 // ── Address I/O ───────────────────────────────────────────────────────────────
 
-const ATYP_IPV4: u8   = 0x01;
+const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
-const ATYP_IPV6: u8   = 0x04;
+const ATYP_IPV6: u8 = 0x04;
 
 /// Read SOCKS5-style address from a plaintext byte slice → `"host:port"`.
 /// Used after the 2022 header has been decrypted.
@@ -154,28 +173,38 @@ pub fn parse_address(buf: &mut impl Buf) -> Result<String> {
     let atyp = buf.get_u8();
     let host = match atyp {
         ATYP_IPV4 => {
-            if buf.remaining() < 4 { bail!("truncated IPv4"); }
+            if buf.remaining() < 4 {
+                bail!("truncated IPv4");
+            }
             let mut b = [0u8; 4];
             buf.copy_to_slice(&mut b);
             Ipv4Addr::from(b).to_string()
         }
         ATYP_DOMAIN => {
-            if buf.remaining() < 1 { bail!("truncated domain length"); }
+            if buf.remaining() < 1 {
+                bail!("truncated domain length");
+            }
             let len = buf.get_u8() as usize;
-            if buf.remaining() < len { bail!("truncated domain"); }
+            if buf.remaining() < len {
+                bail!("truncated domain");
+            }
             let mut b = vec![0u8; len];
             buf.copy_to_slice(&mut b);
             String::from_utf8(b)?
         }
         ATYP_IPV6 => {
-            if buf.remaining() < 16 { bail!("truncated IPv6"); }
+            if buf.remaining() < 16 {
+                bail!("truncated IPv6");
+            }
             let mut b = [0u8; 16];
             buf.copy_to_slice(&mut b);
             format!("[{}]", Ipv6Addr::from(b))
         }
         _ => bail!("shadowsocks 2022: unknown ATYP {atyp:#x}"),
     };
-    if buf.remaining() < 2 { bail!("truncated port"); }
+    if buf.remaining() < 2 {
+        bail!("truncated port");
+    }
     let port = buf.get_u16();
     Ok(format!("{host}:{port}"))
 }
@@ -187,19 +216,24 @@ pub fn parse_address(buf: &mut impl Buf) -> Result<String> {
 pub fn parse_request_header(data: &[u8], expected_type: u8) -> Result<String> {
     // Minimum: TYPE(1) + TIMESTAMP(8) + ATYP(1) + IPv4(4) + PORT(2) + PADDING_LEN(2) = 18
     if data.len() < 18 {
-        bail!("shadowsocks 2022: request header too short ({} bytes)", data.len());
+        bail!(
+            "shadowsocks 2022: request header too short ({} bytes)",
+            data.len()
+        );
     }
 
     let mut pos = 0;
 
     // TYPE (1 byte)
-    let stream_type = data[pos]; pos += 1;
+    let stream_type = data[pos];
+    pos += 1;
     if stream_type != expected_type {
         bail!("shadowsocks 2022: wrong stream type {stream_type:#x}, expected {expected_type:#x}");
     }
 
     // TIMESTAMP (8 bytes, big-endian u64)
-    let ts = u64::from_be_bytes(data[pos..pos+8].try_into().unwrap()); pos += 8;
+    let ts = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
     check_timestamp(ts)?;
 
     // Address (SOCKS5 style) — parse_address advances through the slice
@@ -273,7 +307,8 @@ pub fn build_response_header(request_salt: &[u8]) -> Vec<u8> {
 #[allow(dead_code)]
 fn encode_address(addr: &str, buf: &mut BytesMut) -> Result<()> {
     // addr is "host:port"
-    let (host, port_str) = addr.rsplit_once(':')
+    let (host, port_str) = addr
+        .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("invalid address: {addr}"))?;
     let port: u16 = port_str.parse()?;
     let host = host.trim_matches(|c| c == '[' || c == ']');
@@ -309,7 +344,13 @@ pub struct AeadReader<R> {
 
 impl<R: AsyncRead + Unpin> AeadReader<R> {
     pub fn new(inner: R, cipher: ShadowsocksCipher, subkey: Vec<u8>) -> Self {
-        Self { inner, cipher, subkey, nonce: [0u8; 12], buf: BytesMut::new() }
+        Self {
+            inner,
+            cipher,
+            subkey,
+            nonce: [0u8; 12],
+            buf: BytesMut::new(),
+        }
     }
 
     /// Decrypt one AEAD chunk from the wire into `self.buf`.
@@ -391,7 +432,12 @@ pub struct AeadWriter<W> {
 
 impl<W: AsyncWrite + Unpin> AeadWriter<W> {
     pub fn new(inner: W, cipher: ShadowsocksCipher, subkey: Vec<u8>) -> Self {
-        Self { inner, cipher, subkey, nonce: [0u8; 12] }
+        Self {
+            inner,
+            cipher,
+            subkey,
+            nonce: [0u8; 12],
+        }
     }
 
     pub async fn write_raw(&mut self, data: &[u8]) -> Result<()> {

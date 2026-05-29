@@ -26,7 +26,10 @@ pub struct VirtualDevice {
 
 impl VirtualDevice {
     pub fn new() -> Self {
-        Self { rx: VecDeque::new(), tx: VecDeque::new() }
+        Self {
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+        }
     }
 
     /// 将明文 IP 包注入接收队列（供 smoltcp 消费）。
@@ -36,8 +39,14 @@ impl VirtualDevice {
 }
 
 impl Device for VirtualDevice {
-    type RxToken<'a> = VirtRx where Self: 'a;
-    type TxToken<'a> = VirtTx<'a> where Self: 'a;
+    type RxToken<'a>
+        = VirtRx
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtTx<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _ts: SmolInstant) -> Option<(VirtRx, VirtTx<'_>)> {
         let pkt = self.rx.pop_front()?;
@@ -87,8 +96,8 @@ impl<'a> TxToken for VirtTx<'a> {
 
 /// smoltcp Interface + SocketSet，封装在一起方便传递。
 pub struct VirtualIface {
-    pub device:  VirtualDevice,
-    pub iface:   Interface,
+    pub device: VirtualDevice,
+    pub iface: Interface,
     pub sockets: SocketSet<'static>,
 }
 
@@ -106,12 +115,22 @@ impl VirtualIface {
             }
         });
 
-        iface.routes_mut().add_default_ipv4_route(Ipv4Address::UNSPECIFIED).ok();
-        iface.routes_mut().add_default_ipv6_route(Ipv6Address::UNSPECIFIED).ok();
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::UNSPECIFIED)
+            .ok();
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Address::UNSPECIFIED)
+            .ok();
 
         let sockets = SocketSet::new(vec![]);
 
-        Self { device, iface, sockets }
+        Self {
+            device,
+            iface,
+            sockets,
+        }
     }
 
     /// 注入一个明文 IP 包并驱动 smoltcp poll，返回需要回传的出站包。
