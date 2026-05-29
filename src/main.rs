@@ -3,6 +3,7 @@ mod common;
 mod config;
 mod hysteria2;
 mod shadowsocks;
+mod socks;
 mod trojan;
 mod tuic;
 mod vless;
@@ -47,9 +48,10 @@ async fn main() -> Result<()> {
         && cfg.shadowsocks.is_none()
         && cfg.wireguard.is_none()
         && cfg.anytls.is_none()
+        && cfg.socks.is_none()
     {
         anyhow::bail!(
-            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], [shadowsocks], [wireguard], or [anytls] section"
+            "no protocols configured — add a [hysteria2], [vless], [tuic], [trojan], [vmess], [shadowsocks], [wireguard], [anytls], or [socks] section"
         );
     }
 
@@ -157,6 +159,19 @@ async fn main() -> Result<()> {
         let h = tokio::spawn(async move {
             if let Err(e) = anytls::server::run(anytls_cfg).await {
                 tracing::error!("[anytls] server exited with error: {e:#}");
+            }
+        });
+        handles.push(h);
+    }
+
+    // ── SOCKS5 ────────────────────────────────────────────────────────────────
+    if let Some(socks_cfg) = cfg.socks.clone() {
+        let socks_cfg = Arc::new(socks_cfg);
+        let auth_label = if socks_cfg.users.is_empty() { "no-auth" } else { "password" };
+        info!("[socks5] enabled, listen: {}, auth={auth_label}", socks_cfg.listen);
+        let h = tokio::spawn(async move {
+            if let Err(e) = socks::run(socks_cfg).await {
+                tracing::error!("[socks5] server exited with error: {e:#}");
             }
         });
         handles.push(h);

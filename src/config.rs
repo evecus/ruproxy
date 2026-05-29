@@ -19,6 +19,30 @@ pub struct Config {
     pub shadowsocks: Option<ShadowsocksConfig>,
     pub wireguard: Option<WireGuardConfig>,
     pub anytls: Option<AnyTlsConfig>,
+    pub socks: Option<SocksConfig>,
+}
+
+// ── SOCKS5 ────────────────────────────────────────────────────────────────────
+
+/// A username/password credential pair for SOCKS5 authentication.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SocksUser {
+    pub username: String,
+    pub password: String,
+}
+
+/// SOCKS5 server configuration.
+///
+/// When `users` is empty the server runs in **no-auth** mode (METHOD 0x00).
+/// When `users` is non-empty only **username/password** auth (RFC 1929) is
+/// accepted; unauthenticated clients are rejected.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SocksConfig {
+    /// TCP listen address, e.g. "0.0.0.0:1080"
+    pub listen: String,
+    /// Optional credential list. Leave empty for no-auth mode.
+    #[serde(default)]
+    pub users: Vec<SocksUser>,
 }
 
 // ── TUIC ──────────────────────────────────────────────────────────────────────

@@ -397,3 +397,39 @@ allowed_ips = ["10.0.0.2/32"]                 # 该客户端在隧道内的 IP
 # [[wireguard.peers]]
 # public_key  = "CLIENT2_PUBLIC_KEY_BASE64"
 # allowed_ips = ["10.0.0.3/32"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. SOCKS5   (标准 SOCKS5 代理，RFC 1928 / RFC 1929)
+# ══════════════════════════════════════════════════════════════════════════════
+# 支持两种认证模式（任选其一）：
+#   A. 无认证（no-auth）：省略 [[socks.users]] 即可，适合内网使用
+#   B. 用户名/密码认证：填写一个或多个 [[socks.users]] 条目
+#
+# 客户端示例（curl）：
+#   curl -x socks5h://user:pass@127.0.0.1:1080 https://example.com
+#
+# 客户端示例（sing-box outbound）：
+#   type: socks
+#   server: your.server.com
+#   server_port: 1080
+#   username: alice       # 无认证时删除此行
+#   password: s3cr3t      # 无认证时删除此行
+#   version: 5
+#
+# ── 9-A: SOCKS5 无认证（内网 / 受信任环境）──────────────────────────────────
+# [socks]
+# listen = "0.0.0.0:1080"
+
+# ── 9-B: SOCKS5 用户名/密码认证 ──────────────────────────────────────────────
+[socks]
+listen = "0.0.0.0:1080"
+
+[[socks.users]]
+username = "alice"
+password = "s3cr3t"
+
+# 追加更多用户：
+# [[socks.users]]
+# username = "bob"
+# password = "another-password"
