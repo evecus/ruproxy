@@ -8,12 +8,12 @@
 //!    原版 `accept_hyper` 死等 `ready_rx.await`，要求 GET 请求必须先于 POST 到达。
 //!    但 xhttp 协议不保证顺序，POST 先到时连接永久挂死。
 //!    ✔ 新版：GET handler 到达时通过 `Notify` 通知 accept，accept 仅等待 GET 就绪
-//!      （30s 超时），GET/POST 顺序无关。
+//!    （30s 超时），GET/POST 顺序无关。
 //!
 //! 2. **Mutex 跨 await 持锁**
 //!    原版用 `Arc<Mutex<Receiver>>` 在 GET handler 持锁跨 await，有死锁风险。
 //!    ✔ 新版：down_rx 存在 `ServiceShared` 里，GET handler 直接 take() 独占，
-//!      不共享，不加锁跨 await。
+//!    不共享，不加锁跨 await。
 //!
 //! 3. **poll_write busy-loop**
 //!    原版 channel 满时 `wake_by_ref() + Pending` = CPU 忙等，可能饿死其他任务。
@@ -201,7 +201,7 @@ async fn handle_request(
             return plain(StatusCode::NOT_FOUND);
         }
         let suffix = req_path[shared.path.len()..].trim_start_matches('/');
-        let seq_owned = suffix.splitn(2, '/').nth(1).map(str::to_owned);
+        let seq_owned = suffix.split_once('/').map(|x| x.1.to_owned());
         (*req.method() == Method::GET, seq_owned)
     };
 
