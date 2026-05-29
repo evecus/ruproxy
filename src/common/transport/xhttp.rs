@@ -193,25 +193,27 @@ async fn handle_request(
         }
     }
 
-    // Path 校验
-    let req_path = req.uri().path();
-    if !req_path.starts_with(shared.path.as_str()) {
-        warn!("[xhttp] {peer} bad path: {req_path}");
-        return plain(StatusCode::NOT_FOUND);
-    }
+    // Path 校验，在借用 req 结束前把需要的信息复制成 owned 值
+    let (is_get, seq_str): (bool, Option<String>) = {
+        let req_path = req.uri().path();
+        if !req_path.starts_with(shared.path.as_str()) {
+            warn!("[xhttp] {peer} bad path: {req_path}");
+            return plain(StatusCode::NOT_FOUND);
+        }
+        let suffix = req_path[shared.path.len()..].trim_start_matches('/');
+        let seq_owned = suffix.splitn(2, '/').nth(1).map(str::to_owned);
+        (*req.method() == Method::GET, seq_owned)
+    };
 
     // CORS preflight
-    if req.method() == Method::OPTIONS {
+    if *req.method() == Method::OPTIONS {
         return cors_ok();
     }
 
-    // 解析 path 尾部 /<session>[/<seq>]
-    let suffix = req_path[shared.path.len()..].trim_start_matches('/');
-    let seq_str = suffix.splitn(2, '/').nth(1); // 取第二段（序号）
-
-    match req.method() {
-        &Method::GET => handle_get(shared, peer).await,
-        _ => handle_post(req, shared, seq_str, peer).await,
+    if is_get {
+        handle_get(shared, peer).await
+    } else {
+        handle_post(req, shared, seq_str.as_deref(), peer).await
     }
 }
 
@@ -474,7 +476,7 @@ impl AsyncWrite for XhttpStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
 
         // poll_reserve：等 channel 有空位，满时真正挂起（不 busy-loop）
