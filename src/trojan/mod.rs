@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
-use crate::common::transport::xhttp::{self, XhttpConfig};
+use crate::common::transport::xhttp::{XhttpConfig, XhttpServer};
 use crate::config::TrojanConfig;
 
 pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
@@ -30,6 +30,58 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
         cfg.transport.r#type,
         if tls_acceptor.is_some() { "yes" } else { "no" },
     );
+
+    // ── xhttp：server 级别 session 表 ─────────────────────────────────────────
+    if cfg.transport.r#type == "xhttp" {
+        let xh_cfg = XhttpConfig {
+            path: cfg.transport.xhttp_path.clone(),
+            host: cfg.transport.xhttp_host.clone(),
+        };
+        let xhttp_server = XhttpServer::new(xh_cfg);
+        let password = cfg.password.clone();
+
+        let srv_feed = xhttp_server.clone();
+        let tls2 = tls_acceptor.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(e) => { warn!("[trojan] accept error: {e}"); continue; }
+                };
+                match &tls2 {
+                    None => { srv_feed.feed_plain(stream, peer); }
+                    Some(acc) => {
+                        let acc = Arc::clone(acc);
+                        let srv = srv_feed.clone();
+                        tokio::spawn(async move {
+                            match acc.accept(stream).await {
+                                Ok(tls) => srv.feed_tls(tls, peer),
+                                Err(e) => warn!("[trojan] {peer} TLS: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        loop {
+            match xhttp_server.accept().await {
+                None => { warn!("[trojan] xhttp server closed"); break; }
+                Some(xhs) => {
+                    let pw = password.clone();
+                    tokio::spawn(async move {
+                        let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        if let Err(e) = process(xhs, peer, &pw).await {
+                            warn!("[trojan] {peer}: {e:#}");
+                        }
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── 其他 transport ────────────────────────────────────────────────────────
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = cfg.clone();
@@ -51,8 +103,6 @@ async fn handle(
     let transport = cfg.transport.r#type.as_str();
     let ws_path = cfg.transport.ws_path.as_str();
     let ws_host = cfg.transport.ws_host.as_deref();
-    let xhttp_path = cfg.transport.xhttp_path.as_str();
-    let xhttp_host = cfg.transport.xhttp_host.clone();
 
     let mut io: Box<dyn AsyncReadWrite> = match (transport, tls_acceptor) {
         ("tcp", None) => Box::new(stream),
@@ -62,25 +112,17 @@ async fn handle(
             let tls = acc.accept(stream).await?;
             Box::new(shared_ws::accept_tls(tls, ws_path, ws_host).await?)
         }
-        ("xhttp", None) => {
-            let xh_cfg = XhttpConfig {
-                path: xhttp_path.to_string(),
-                host: xhttp_host,
-            };
-            Box::new(xhttp::accept_plain(stream, peer, &xh_cfg).await?)
-        }
-        ("xhttp", Some(acc)) => {
-            let tls = acc.accept(stream).await?;
-            let xh_cfg = XhttpConfig {
-                path: xhttp_path.to_string(),
-                host: xhttp_host,
-            };
-            Box::new(xhttp::accept_tls(tls, peer, &xh_cfg).await?)
-        }
         _ => bail!("trojan: unknown transport"),
     };
+    process(&mut *io, peer, &cfg.password).await
+}
 
-    let target = decode_trojan(&mut io, &cfg.password).await?;
+async fn process<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut S,
+    peer: SocketAddr,
+    password: &str,
+) -> Result<()> {
+    let target = decode_trojan(io, password).await?;
     info!("[trojan] {peer} -> {target}");
     let outbound = TcpStream::connect(&target).await?;
     relay(io, outbound).await
@@ -94,22 +136,14 @@ async fn decode_trojan<S: AsyncRead + Unpin>(s: &mut S, password: &str) -> Resul
     loop {
         let b = s.read_u8().await?;
         line.push(b);
-        if line.ends_with(b"\r\n") {
-            break;
-        }
-        if line.len() > 256 {
-            bail!("bad auth")
-        }
+        if line.ends_with(b"\r\n") { break; }
+        if line.len() > 256 { bail!("bad auth") }
     }
     let got = String::from_utf8_lossy(&line[..line.len() - 2]);
     let expected = hex::encode(Sha224::digest(password.as_bytes()));
-    if got != expected {
-        bail!("invalid password");
-    }
+    if got != expected { bail!("invalid password"); }
     let cmd = s.read_u8().await?;
-    if cmd != 1 {
-        bail!("only tcp supported");
-    }
+    if cmd != 1 { bail!("only tcp supported"); }
     let atyp = s.read_u8().await?;
     let host = match atyp {
         1 => {
@@ -136,9 +170,9 @@ async fn decode_trojan<S: AsyncRead + Unpin>(s: &mut S, password: &str) -> Resul
     Ok(format!("{host}:{port}"))
 }
 
-async fn relay(mut inbound: Box<dyn AsyncReadWrite>, outbound: TcpStream) -> Result<()> {
+async fn relay<S: AsyncRead + AsyncWrite + Unpin>(inbound: &mut S, outbound: TcpStream) -> Result<()> {
     let (mut or, mut ow) = outbound.into_split();
-    let (mut ir, mut iw) = tokio::io::split(&mut inbound);
+    let (mut ir, mut iw) = tokio::io::split(inbound);
     let a = async {
         let _ = tokio::io::copy(&mut ir, &mut ow).await;
         let _ = ow.shutdown().await;
