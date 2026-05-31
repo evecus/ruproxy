@@ -94,7 +94,7 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
                 Some(xhs) => {
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        if let Err(e) = process(xhs, peer, cmd_key, uuid).await {
+                        if let Err(e) = process(&mut xhs, peer, cmd_key, uuid).await {
                             warn!("[vmess] {peer}: {e:#}");
                         }
                     });
@@ -145,7 +145,7 @@ async fn handle(
 
 async fn process<S>(io: &mut S, peer: SocketAddr, cmd_key: [u8; 16], uuid: [u8; 16]) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
     let req = decode_vmess_aead_request(io, &cmd_key, &uuid)
         .await
