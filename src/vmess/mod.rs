@@ -94,7 +94,8 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
                 Some(xhs) => {
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        if let Err(e) = process(&mut xhs, peer, cmd_key, uuid).await {
+                        let mut io: Box<dyn AsyncReadWrite> = Box::new(xhs);
+                        if let Err(e) = process(&mut *io, peer, cmd_key, uuid).await {
                             warn!("[vmess] {peer}: {e:#}");
                         }
                     });
@@ -145,7 +146,7 @@ async fn handle(
 
 async fn process<S>(io: &mut S, peer: SocketAddr, cmd_key: [u8; 16], uuid: [u8; 16]) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let req = decode_vmess_aead_request(io, &cmd_key, &uuid)
         .await
@@ -176,7 +177,7 @@ struct VmessRequest {
     request_body_iv: [u8; 16],
 }
 
-async fn decode_vmess_aead_request<S: AsyncRead + Unpin>(
+async fn decode_vmess_aead_request<S: AsyncRead + Unpin + ?Sized>(
     s: &mut S,
     cmd_key: &[u8; 16],
     _uuid: &[u8; 16],
@@ -301,7 +302,7 @@ fn fnv1a_32(data: &[u8]) -> u32 {
     h
 }
 
-async fn encode_vmess_aead_response<S: AsyncWrite + Unpin>(
+async fn encode_vmess_aead_response<S: AsyncWrite + Unpin + ?Sized>(
     s: &mut S,
     request_body_key: [u8; 16],
     request_body_iv: [u8; 16],
