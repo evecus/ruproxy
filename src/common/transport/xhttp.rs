@@ -159,7 +159,7 @@ where
             Ok::<_, std::convert::Infallible>(resp)
         }
     });
-    if let Err(e) = hyper::server::conn::http1::Builder::new()
+    if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
         .serve_connection(io, svc)
         .await
     {
