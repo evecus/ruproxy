@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
-use crate::common::transport::xhttp::{self, XhttpConfig};
+use crate::common::transport::xhttp::{XhttpConfig, XhttpServer};
 use crate::config::ShadowsocksConfig;
 use crate::shadowsocks::protocol::{
     build_response_header, decode_master_key, derive_session_subkey, parse_request_header,
@@ -41,6 +41,60 @@ pub async fn run(cfg: Arc<ShadowsocksConfig>) -> Result<()> {
         if tls_acceptor.is_some() { "yes" } else { "no" },
     );
 
+    // ── xhttp：server 级别 session 表 ─────────────────────────────────────────
+    if cfg.transport.r#type == "xhttp" {
+        let xh_cfg = XhttpConfig {
+            path: cfg.transport.xhttp_path.clone(),
+            host: cfg.transport.xhttp_host.clone(),
+        };
+        let xhttp_server = XhttpServer::new(xh_cfg);
+        let key2 = Arc::clone(&master_key);
+        let cfg2 = Arc::clone(&cfg);
+
+        let srv_feed = xhttp_server.clone();
+        let tls2 = tls_acceptor.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(e) => { warn!("[shadowsocks] accept error: {e}"); continue; }
+                };
+                debug!("[shadowsocks] new connection from {peer}");
+                match &tls2 {
+                    None => { srv_feed.feed_plain(stream, peer); }
+                    Some(acc) => {
+                        let acc = Arc::clone(acc);
+                        let srv = srv_feed.clone();
+                        tokio::spawn(async move {
+                            match acc.accept(stream).await {
+                                Ok(tls) => srv.feed_tls(tls, peer),
+                                Err(e) => warn!("[shadowsocks] {peer} TLS: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        loop {
+            match xhttp_server.accept().await {
+                None => { warn!("[shadowsocks] xhttp server closed"); break; }
+                Some(xhs) => {
+                    let key = Arc::clone(&key2);
+                    let cfg3 = Arc::clone(&cfg2);
+                    tokio::spawn(async move {
+                        let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        if let Err(e) = process(xhs, peer, &cfg3, &key).await {
+                            warn!("[shadowsocks] {peer}: {e:#}");
+                        }
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── 其他 transport ────────────────────────────────────────────────────────
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = Arc::clone(&cfg);
@@ -66,8 +120,6 @@ async fn handle_conn(
     let transport = cfg.transport.r#type.as_str();
     let ws_path = cfg.transport.ws_path.as_str();
     let ws_host = cfg.transport.ws_host.as_deref();
-    let xh_path = cfg.transport.xhttp_path.as_str();
-    let xh_host = cfg.transport.xhttp_host.clone();
 
     match (transport, tls_acceptor) {
         ("tcp", None) => process(stream, peer, cfg, master_key).await,
@@ -83,23 +135,6 @@ async fn handle_conn(
             let tls = acc.accept(stream).await?;
             let ws = shared_ws::accept_tls(tls, ws_path, ws_host).await?;
             process(ws, peer, cfg, master_key).await
-        }
-        ("xhttp", None) => {
-            let xh_cfg = XhttpConfig {
-                path: xh_path.to_string(),
-                host: xh_host,
-            };
-            let xh = xhttp::accept_plain(stream, peer, &xh_cfg).await?;
-            process(xh, peer, cfg, master_key).await
-        }
-        ("xhttp", Some(acc)) => {
-            let tls = acc.accept(stream).await?;
-            let xh_cfg = XhttpConfig {
-                path: xh_path.to_string(),
-                host: xh_host,
-            };
-            let xh = xhttp::accept_tls(tls, peer, &xh_cfg).await?;
-            process(xh, peer, cfg, master_key).await
         }
         (other, _) => anyhow::bail!("shadowsocks: unknown transport '{other}'"),
     }
@@ -117,24 +152,18 @@ where
     let salt_len = cfg.method.salt_len();
     let cipher = cfg.method.clone();
 
-    // 1. Read client salt (plaintext, key_len bytes)
     let mut client_salt = vec![0u8; salt_len];
     stream.read_exact(&mut client_salt).await?;
 
-    // 2. Derive uplink session subkey (BLAKE3-KDF)
     let up_subkey = derive_session_subkey(master_key, &client_salt, salt_len);
 
-    // 3. Split into AEAD reader + raw writer
     let (read_half, write_half) = tokio::io::split(stream);
     let mut aead_r = AeadReader::new(read_half, cipher.clone(), up_subkey);
 
-    // 4. Read & validate the 2022 request fixed header chunk
-    //    (TYPE | TIMESTAMP | ATYP | ADDR | PORT | PADDING_LEN | PADDING)
     let header_data = aead_r.read_header_chunk().await?;
     let target = parse_request_header(&header_data, STREAM_TYPE_REQUEST)?;
     info!("[shadowsocks] {peer} → {target}");
 
-    // 5. Connect upstream
     let outbound = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         TcpStream::connect(&target),
@@ -142,22 +171,18 @@ where
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout: {target}"))??;
 
-    // 6. Write response: salt + response header chunk + relay
     let mut resp_salt = vec![0u8; salt_len];
     rand::thread_rng().fill_bytes(&mut resp_salt);
     let dn_subkey = derive_session_subkey(master_key, &resp_salt, salt_len);
 
-    // Write response salt (plaintext), then switch to response subkey
     let mut aead_w = AeadWriter::new(write_half, cipher.clone(), vec![0u8; salt_len]);
     aead_w.write_raw(&resp_salt).await?;
     aead_w.reset_subkey(dn_subkey);
 
-    // 2022 response fixed header: TYPE(1) | TIMESTAMP(8) | REQUEST_SALT(salt_len)
     let resp_header = build_response_header(&client_salt);
     aead_w.write_header_chunk(&resp_header).await?;
     aead_w.flush().await?;
 
-    // 7. Relay
     let (mut out_r, mut out_w) = outbound.into_split();
     let t = target.clone();
 
@@ -168,12 +193,7 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n])
-                .await
-                .is_err()
-            {
-                break;
-            }
+            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n]).await.is_err() { break; }
         }
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut out_w).await;
         debug!("[shadowsocks] uplink closed {peer}→{t}");
@@ -187,12 +207,8 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if aead_w.write_data(&tmp[..n]).await.is_err() {
-                break;
-            }
-            if aead_w.flush().await.is_err() {
-                break;
-            }
+            if aead_w.write_data(&tmp[..n]).await.is_err() { break; }
+            if aead_w.flush().await.is_err() { break; }
         }
         debug!("[shadowsocks] downlink closed {t2}→{peer}");
     };
