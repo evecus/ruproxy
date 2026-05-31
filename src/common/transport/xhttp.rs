@@ -1,48 +1,37 @@
-//! XHTTP (SplitHTTP) transport — server-side accept.
+//! XHTTP (SplitHTTP) transport — server 级别 session 管理。
 //!
-//! ## 与 Xray splithttp hub.go 的对齐说明
+//! ## 架构
 //!
-//! ### Xray 默认行为（mode = "auto" → "packet-up"，无 Reality 时）
+//! Xray packet-up 模式下，一个逻辑连接 = 多个独立 TCP 连接：
+//!   GET  /<base>/<sessionId>        → downlink（长连接流式响应）
+//!   POST /<base>/<sessionId>/<seq>  → packet-up（每包一个短连接）
+//!   POST /<base>/<sessionId>        → stream-up（长连接流式上行）
+//!   GET  /<base>                    → stream-one（上下行同一连接）
 //!
-//! URL 结构（sessionPlacement=path, seqPlacement=path 为默认值）：
-//!   GET  /<basepath>/<sessionId>          → downlink（流式响应体）
-//!   POST /<basepath>/<sessionId>/<seq>    → packet-up（带序号的单包）
-//!   POST /<basepath>/<sessionId>          → stream-up（无序号，流式 body）
-//!   GET  /<basepath>                      → stream-one（无 sessionId）
+//! 因此 session 表必须跨 TCP 连接共享。
 //!
-//! ### 原版 ruproxy xhttp.rs 的核心问题
+//! ## 使用方式
 //!
-//! 原版把每个 TCP 连接当作一个独立的 session，在 HTTP 层没有 session 管理：
-//!   - 没有解析 sessionId：GET/<base>/<sid> 和 POST/<base>/<sid> 无法对应
-//!   - accept_hyper 等待一个 GET，但 packet-up 模式下 POST 会先到达（甚至只有 POST）
-//!   - path 解析逻辑错误：Xray 路径是 /<base>/<sid>[/<seq>]，原版解析的格式不同
+//! ```rust
+//! // 1. 启动时创建 server（含共享 session 表）
+//! let xhttp_server = XhttpServer::new(cfg);
 //!
-//! ### 本次修复内容
+//! // 2. 每个 TCP 连接调用 feed_plain / feed_tls（立即返回）
+//! xhttp_server.feed_plain(tcp_stream, peer);
 //!
-//! 1. **Session 表**
-//!    用 `Arc<Mutex<HashMap<String, Arc<Notify>>>>` 追踪已知 sessionId。
-//!    每个 session 有一个 `Notify`，GET handler 到达时触发，供 TTL 清理用。
-//!    核心的 up_tx / down_rx 仍然是全局唯一的（每个 TCP 连接一对），
-//!    因为 accept_hyper 只返回一个 XhttpStream，所有 session 共享同一上下行通道。
-//!
-//! 2. **Path 解析修正**（对齐 Xray ExtractMetaFromRequest）
-//!    /<basepath>/<sessionId>          → session_id=Some, seq=None
-//!    /<basepath>/<sessionId>/<seq>    → session_id=Some, seq=Some
-//!    /<basepath>                      → session_id=None  (stream-one)
-//!
-//! 3. **Session TTL**
-//!    POST 先到时创建 session 记录并启动 30s TTL；
-//!    GET 到达时通知 TTL goroutine 退出，防止内存泄漏。
-//!
-//! 4. **accept_hyper 等待逻辑修正**
-//!    等待 GET 就绪通知（无论 GET/POST 谁先到），超时 30s。
-//!
-//! ### 数据流
-//!
-//! ```text
-//!  客户端 POST ──► handle_post ──► up_tx ──► up_rx ──► XhttpStream::poll_read
-//!  XhttpStream::poll_write ──► down_tx ──► down_rx ──► GET response body (StreamBody)
+//! // 3. accept() 等待下一个完整逻辑连接（GET 已到达）
+//! let stream: XhttpStream = xhttp_server.accept().await.unwrap();
 //! ```
+//!
+//! ## Session 内部结构
+//!
+//! 创建时分配：
+//!   up_tx / up_rx   — POST 写入，XhttpStream 读端消费
+//!   down_tx / down_rx — XhttpStream 写端写入，GET response body 消费
+//!
+//! Session 在 map 里只保留 { up_tx, down_tx, get_arrived }。
+//! up_rx 和 down_rx 在 GET 到达时一次性取出，构造 XhttpStream 推入 ready_tx。
+//! POST 到达时只需要 up_tx（随时可拿到）。
 
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
@@ -56,8 +45,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Notify, oneshot};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_util::sync::PollSender;
 use tracing::{debug, warn};
 
@@ -76,7 +64,6 @@ impl Default for XhttpConfig {
 }
 
 impl XhttpConfig {
-    /// 返回规范化后的 base path，末尾统一带 '/'
     pub fn normalized_path(&self) -> String {
         let p = self.path.trim_end_matches('/');
         let p = if p.starts_with('/') { p.to_string() } else { format!("/{p}") };
@@ -87,143 +74,164 @@ impl XhttpConfig {
 // ── 上行数据包 ─────────────────────────────────────────────────────────────────
 
 enum UploadPacket {
-    Chunk(bytes::Bytes),                     // stream-up chunk
-    Packet { seq: u64, data: bytes::Bytes }, // packet-up with seq
+    Chunk(bytes::Bytes),
+    Packet { seq: u64, data: bytes::Bytes },
     Eof,
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Session ───────────────────────────────────────────────────────────────────
 
-pub async fn accept_plain(
-    stream: TcpStream,
-    peer: SocketAddr,
-    cfg: &XhttpConfig,
-) -> Result<XhttpStream> {
-    accept_hyper(hyper_util::rt::TokioIo::new(stream), peer, cfg).await
+struct Session {
+    /// POST handler 写上行数据
+    up_tx: mpsc::Sender<UploadPacket>,
+    /// GET handler 到达时取走，构造 XhttpStream 的读端
+    up_rx: Option<mpsc::Receiver<UploadPacket>>,
+    /// XhttpStream 写端写下行数据
+    down_tx: mpsc::Sender<bytes::Bytes>,
+    /// GET handler 到达时取走，作为 response body
+    down_rx: Option<mpsc::Receiver<bytes::Bytes>>,
+    /// GET 到达通知（供 TTL 任务监听）
+    get_arrived: Arc<Notify>,
 }
 
-pub async fn accept_tls<S>(stream: S, peer: SocketAddr, cfg: &XhttpConfig) -> Result<XhttpStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    accept_hyper(hyper_util::rt::TokioIo::new(stream), peer, cfg).await
+// ── XhttpServer ───────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct XhttpServer {
+    inner: Arc<ServerInner>,
 }
 
-// ── accept_hyper ──────────────────────────────────────────────────────────────
+struct ServerInner {
+    cfg:      XhttpConfig,
+    sessions: Mutex<HashMap<String, Arc<Mutex<Session>>>>,
+    ready_tx: mpsc::Sender<XhttpStream>,
+    ready_rx: Mutex<mpsc::Receiver<XhttpStream>>,
+}
 
-async fn accept_hyper<IO>(io: IO, peer: SocketAddr, cfg: &XhttpConfig) -> Result<XhttpStream>
+impl XhttpServer {
+    pub fn new(cfg: XhttpConfig) -> Self {
+        let (ready_tx, ready_rx) = mpsc::channel(64);
+        Self {
+            inner: Arc::new(ServerInner {
+                cfg,
+                sessions: Mutex::new(HashMap::new()),
+                ready_tx,
+                ready_rx: Mutex::new(ready_rx),
+            }),
+        }
+    }
+
+    /// 等待下一个完整的 xhttp 逻辑连接就绪，返回 XhttpStream。
+    pub async fn accept(&self) -> Option<XhttpStream> {
+        self.inner.ready_rx.lock().await.recv().await
+    }
+
+    /// 把一个明文 TCP 流交给 hyper（立即返回，不阻塞）。
+    pub fn feed_plain(&self, stream: tokio::net::TcpStream, peer: SocketAddr) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            serve_conn(hyper_util::rt::TokioIo::new(stream), peer, inner).await;
+        });
+    }
+
+    /// 把一个已完成 TLS/Reality 握手的流交给 hyper（立即返回，不阻塞）。
+    pub fn feed_tls<S>(&self, stream: S, peer: SocketAddr)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            serve_conn(hyper_util::rt::TokioIo::new(stream), peer, inner).await;
+        });
+    }
+}
+
+// ── hyper 连接 ────────────────────────────────────────────────────────────────
+
+async fn serve_conn<IO>(io: IO, peer: SocketAddr, inner: Arc<ServerInner>)
 where
     IO: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
-    let base_path = cfg.normalized_path();
-    let host = cfg.host.clone();
-
-    // 上行 channel：HTTP POST handler → XhttpStream 读端
-    let (up_tx, up_rx) = mpsc::channel::<UploadPacket>(64);
-
-    // 下行 channel：XhttpStream 写端 → GET response body
-    let (down_tx, down_rx) = mpsc::channel::<bytes::Bytes>(64);
-
-    // GET handler 取走 down_rx 后通知 accept 可以继续
-    let (get_done_tx, get_done_rx) = oneshot::channel::<()>();
-
-    // GET 到达通知
-    let get_ready = Arc::new(Notify::new());
-
-    // Session 表：记录已见到的 sessionId，每个 session 有 get_arrived Notify
-    // 用于 POST 先到时启动 TTL，GET 到达时取消 TTL
-    let sessions: Arc<Mutex<HashMap<String, Arc<Notify>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    let shared = Arc::new(ServiceShared {
-        base_path,
-        host,
-        up_tx: up_tx.clone(),
-        down_rx_slot: Mutex::new(Some((down_rx, get_done_tx))),
-        get_ready: Arc::clone(&get_ready),
-        down_tx_clone: down_tx,
-        sessions,
-    });
-
-    tokio::spawn({
-        let shared = Arc::clone(&shared);
+    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+        let inner = Arc::clone(&inner);
         async move {
-            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                let shared = Arc::clone(&shared);
-                async move {
-                    let resp = handle_request(req, &shared, peer).await;
-                    Ok::<_, std::convert::Infallible>(resp)
-                }
-            });
-
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await
-            {
-                debug!("[xhttp] {peer} conn closed: {e}");
-            }
-            // 连接关闭 → 上行 EOF
-            let _ = up_tx.send(UploadPacket::Eof).await;
+            let resp = handle_request(req, &inner, peer).await;
+            Ok::<_, std::convert::Infallible>(resp)
         }
     });
-
-    // 等待 GET 请求到达（最多 30s）
-    tokio::time::timeout(Duration::from_secs(30), get_ready.notified())
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc)
         .await
-        .map_err(|_| anyhow::anyhow!("[xhttp] {peer}: timeout waiting for GET downlink"))?;
-
-    // 等 GET handler 确认已取走 down_rx
-    let _ = tokio::time::timeout(Duration::from_millis(200), get_done_rx).await;
-
-    Ok(XhttpStream::new(up_rx, shared.down_tx_clone.clone()))
+    {
+        debug!("[xhttp] {peer} conn closed: {e}");
+    }
 }
 
-// ── 服务端共享状态 ─────────────────────────────────────────────────────────────
+// ── Session 管理 ───────────────────────────────────────────────────────────────
 
-struct ServiceShared {
-    base_path: String,
-    host: Option<String>,
-    up_tx: mpsc::Sender<UploadPacket>,
-    /// 第一个 GET handler 从这里取走 (down_rx, get_done_tx)（只取一次）
-    down_rx_slot: Mutex<Option<(mpsc::Receiver<bytes::Bytes>, oneshot::Sender<()>)>>,
-    /// GET 到达通知（通知 accept_hyper）
-    get_ready: Arc<Notify>,
-    /// 供 XhttpStream 写端使用的下行 sender clone
-    down_tx_clone: mpsc::Sender<bytes::Bytes>,
-    /// Session 表：sessionId → get_arrived Notify
-    sessions: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+async fn get_or_create_session(
+    inner: &Arc<ServerInner>,
+    session_id: &str,
+) -> Arc<Mutex<Session>> {
+    let mut map = inner.sessions.lock().await;
+    if let Some(s) = map.get(session_id) {
+        return Arc::clone(s);
+    }
+
+    let (up_tx, up_rx) = mpsc::channel::<UploadPacket>(64);
+    let (down_tx, down_rx) = mpsc::channel::<bytes::Bytes>(64);
+    let get_arrived = Arc::new(Notify::new());
+
+    let session = Arc::new(Mutex::new(Session {
+        up_tx,
+        up_rx: Some(up_rx),
+        down_tx,
+        down_rx: Some(down_rx),
+        get_arrived: Arc::clone(&get_arrived),
+    }));
+    map.insert(session_id.to_string(), Arc::clone(&session));
+
+    // TTL：30s 内 GET 未到则清理
+    let inner2 = Arc::clone(inner);
+    let sid = session_id.to_string();
+    tokio::spawn(async move {
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(30),
+            get_arrived.notified(),
+        ).await.is_err();
+
+        if timed_out {
+            debug!("[xhttp] session {sid} TTL expired, cleaning up");
+            let mut map = inner2.sessions.lock().await;
+            if let Some(s) = map.remove(&sid) {
+                // 发送 EOF 给可能正在等待的 XhttpStream
+                let s = s.lock().await;
+                let _ = s.up_tx.send(UploadPacket::Eof).await;
+            }
+        }
+        // GET 到达时 session 已从 map 移除（由 handle_get 负责），这里无需操作
+    });
+
+    session
 }
 
 // ── 路径解析 ───────────────────────────────────────────────────────────────────
 
-/// 从请求路径中解析 (session_id, seq_str)。
-///
-/// Xray 默认 sessionPlacement=path, seqPlacement=path：
-///   /<basepath>/<sessionId>          → (Some(sessionId), None)
-///   /<basepath>/<sessionId>/<seq>    → (Some(sessionId), Some(seq))
-///   /<basepath> 或 /<basepath>/      → (None, None)  ← stream-one
-///
-/// 返回 None 表示 path 不匹配 base_path，应返回 404。
 fn parse_path(req_path: &str, base_path: &str) -> Option<(Option<String>, Option<String>)> {
-    // base_path 末尾有 '/'，例如 "/xhttp/"
-    // req_path 可能是 "/xhttp"（stream-one, 无 trailing slash）
     let base_no_slash = base_path.trim_end_matches('/');
 
     let rest = if req_path == base_no_slash || req_path == base_path {
-        // stream-one 或 /<base>/
         ""
     } else if let Some(s) = req_path.strip_prefix(base_path) {
-        // /<base>/<rest>
         s.trim_start_matches('/')
     } else {
-        return None; // 路径不匹配
+        return None;
     };
 
     if rest.is_empty() {
         return Some((None, None));
     }
 
-    // rest 形如 "<sessionId>" 或 "<sessionId>/<seq>"
     let mut parts = rest.splitn(2, '/');
     let session_id = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
     let seq = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
@@ -234,11 +242,10 @@ fn parse_path(req_path: &str, base_path: &str) -> Option<(Option<String>, Option
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
-    shared: &Arc<ServiceShared>,
+    inner: &Arc<ServerInner>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
-    // Host 校验
-    if let Some(expected) = &shared.host {
+    if let Some(expected) = &inner.cfg.host {
         let req_host = req.headers()
             .get("host")
             .and_then(|v| v.to_str().ok())
@@ -249,54 +256,44 @@ async fn handle_request(
         }
     }
 
-    // CORS preflight
     if *req.method() == Method::OPTIONS {
         return cors_ok();
     }
 
-    // Path 解析
+    let base_path = inner.cfg.normalized_path();
     let req_path = req.uri().path().to_string();
-    let (session_id, seq_str) = match parse_path(&req_path, &shared.base_path) {
+
+    let (session_id, seq_str) = match parse_path(&req_path, &base_path) {
         Some(p) => p,
         None => {
-            warn!("[xhttp] {peer} bad path: {req_path} (base={})", shared.base_path);
+            warn!("[xhttp] {peer} bad path: {req_path} (base={base_path})");
             return plain(StatusCode::NOT_FOUND);
         }
     };
 
-    // 路由：GET 无 seq → downlink/stream-one；其他 → uplink
-    let is_downlink = *req.method() == Method::GET && seq_str.is_none();
+    debug!("[xhttp] {peer} {} session={session_id:?} seq={seq_str:?}",
+           req.method());
 
+    let is_downlink = *req.method() == Method::GET && seq_str.is_none();
     if is_downlink {
-        handle_get(req, shared, session_id.as_deref(), peer).await
+        handle_get(req, inner, session_id.as_deref(), peer).await
     } else {
-        handle_post(req, shared, session_id.as_deref(), seq_str.as_deref(), peer).await
+        handle_post(req, inner, session_id.as_deref(), seq_str.as_deref(), peer).await
     }
 }
 
 /// GET handler：downlink 或 stream-one
 async fn handle_get(
     req: Request<hyper::body::Incoming>,
-    shared: &Arc<ServiceShared>,
+    inner: &Arc<ServerInner>,
     session_id: Option<&str>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
-    debug!("[xhttp] {peer} GET downlink session={session_id:?}");
-
-    // 若有 sessionId，通知对应 session 的 TTL 任务可以退出
-    if let Some(sid) = session_id {
-        let mut smap = shared.sessions.lock().await;
-        let notify = smap.entry(sid.to_string())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone();
-        // 通知 TTL 任务：GET 已到，无需清理
-        notify.notify_one();
-        drop(smap);
-    }
-
-    // stream-one：无 sessionId，把 request body 作为上行数据
+    // ── stream-one：无 sessionId ────────────────────────────────────────────
     if session_id.is_none() {
-        let up_tx = shared.up_tx.clone();
+        let (up_tx, up_rx) = mpsc::channel::<UploadPacket>(64);
+        let (down_tx, down_rx) = mpsc::channel::<bytes::Bytes>(64);
+
         let mut body = req.into_body();
         tokio::spawn(async move {
             loop {
@@ -304,83 +301,74 @@ async fn handle_get(
                     None => break,
                     Some(Ok(frame)) => {
                         if let Ok(data) = frame.into_data() {
-                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() {
-                                break;
-                            }
+                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
                         }
                     }
-                    Some(Err(e)) => {
-                        debug!("[xhttp] {peer} stream-one up frame error: {e}");
-                        break;
-                    }
+                    Some(Err(e)) => { debug!("[xhttp] {peer} stream-one up: {e}"); break; }
                 }
             }
+            let _ = up_tx.send(UploadPacket::Eof).await;
         });
+
+        let xhs = XhttpStream::new(up_rx, down_tx);
+        let _ = inner.ready_tx.send(xhs).await;
+
+        return downlink_response(down_rx);
     }
 
-    // 取出 down_rx slot（只有第一个 GET 能取到）
-    let taken = shared.down_rx_slot.lock().await.take();
-    let (down_rx, done_tx) = match taken {
-        Some(pair) => pair,
+    // ── stream-down：有 sessionId ───────────────────────────────────────────
+    let sid = session_id.unwrap();
+    let session_arc = get_or_create_session(inner, sid).await;
+    let mut session = session_arc.lock().await;
+
+    let up_rx = match session.up_rx.take() {
+        Some(r) => r,
         None => {
-            warn!("[xhttp] {peer} duplicate GET or no down_rx slot");
+            warn!("[xhttp] {peer} duplicate GET for session {sid}");
             return plain(StatusCode::CONFLICT);
         }
     };
+    let down_rx = match session.down_rx.take() {
+        Some(r) => r,
+        None => {
+            warn!("[xhttp] {peer} down_rx already taken for session {sid}");
+            return plain(StatusCode::CONFLICT);
+        }
+    };
+    let down_tx = session.down_tx.clone();
 
-    // 通知 accept_hyper：GET 已就绪，down_rx 已被 response body 持有
-    shared.get_ready.notify_one();
-    let _ = done_tx.send(());
+    // 通知 TTL 任务退出，并从 session 表移除
+    session.get_arrived.notify_one();
+    drop(session);
+    inner.sessions.lock().await.remove(sid);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "application/octet-stream")
-        .header("Cache-Control", "no-cache, no-store")
-        .header("Access-Control-Allow-Origin", "*")
-        .header("X-Accel-Buffering", "no")
-        .body(ResponseBody::Stream(down_rx))
-        .unwrap()
+    // 构造 XhttpStream，推入 ready_tx
+    let xhs = XhttpStream::new(up_rx, down_tx);
+    let _ = inner.ready_tx.send(xhs).await;
+
+    downlink_response(down_rx)
 }
 
 /// POST/PUT handler：接收上行数据
 async fn handle_post(
     req: Request<hyper::body::Incoming>,
-    shared: &Arc<ServiceShared>,
+    inner: &Arc<ServerInner>,
     session_id: Option<&str>,
     seq_str: Option<&str>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
-    debug!("[xhttp] {peer} {} uplink session={session_id:?} seq={seq_str:?}", req.method());
-
-    // POST 先到时，在 session 表中创建记录，并启动 30s TTL
-    // 如果 GET 在 30s 内到达，TTL 任务会被通知提前退出
-    if let Some(sid) = session_id {
-        let mut smap = shared.sessions.lock().await;
-        if !smap.contains_key(sid) {
-            let get_arrived = Arc::new(Notify::new());
-            smap.insert(sid.to_string(), Arc::clone(&get_arrived));
-            // 启动 TTL 任务（仅做日志，实际上连接关闭会自动清理）
-            let sid_owned = sid.to_string();
-            let sessions2 = Arc::clone(&shared.sessions);
-            tokio::spawn(async move {
-                // 等待 GET 到达，或 30s 超时
-                let timed_out = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    get_arrived.notified(),
-                ).await.is_err();
-                if timed_out {
-                    debug!("[xhttp] session {sid_owned} TTL expired (GET never arrived)");
-                    sessions2.lock().await.remove(&sid_owned);
-                }
-            });
-        }
-    }
-
-    let up_tx = shared.up_tx.clone();
+    let up_tx = if let Some(sid) = session_id {
+        let session_arc = get_or_create_session(inner, sid).await;
+        session_arc.lock().await.up_tx.clone()
+    } else {
+        // POST 无 sessionId 不常见，忽略
+        warn!("[xhttp] {peer} POST without sessionId");
+        return plain(StatusCode::BAD_REQUEST);
+    };
 
     match seq_str {
         None => {
-            // stream-up：逐帧转发 body
+            // stream-up
             let mut body = req.into_body();
             tokio::spawn(async move {
                 loop {
@@ -388,21 +376,16 @@ async fn handle_post(
                         None => break,
                         Some(Ok(frame)) => {
                             if let Ok(data) = frame.into_data() {
-                                if up_tx.send(UploadPacket::Chunk(data)).await.is_err() {
-                                    break;
-                                }
+                                if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
                             }
                         }
-                        Some(Err(e)) => {
-                            debug!("[xhttp] {peer} stream-up frame error: {e}");
-                            break;
-                        }
+                        Some(Err(e)) => { debug!("[xhttp] {peer} stream-up: {e}"); break; }
                     }
                 }
             });
         }
         Some(s) => {
-            // packet-up：带序号的单包
+            // packet-up
             let seq: u64 = match s.parse() {
                 Ok(n) => n,
                 Err(_) => {
@@ -419,13 +402,24 @@ async fn handle_post(
                             data: c.to_bytes(),
                         }).await;
                     }
-                    Err(e) => debug!("[xhttp] {peer} packet-up collect error: {e}"),
+                    Err(e) => debug!("[xhttp] {peer} packet-up collect: {e}"),
                 }
             });
         }
     }
 
     plain(StatusCode::OK)
+}
+
+fn downlink_response(down_rx: mpsc::Receiver<bytes::Bytes>) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .header("Cache-Control", "no-cache, no-store")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("X-Accel-Buffering", "no")
+        .body(ResponseBody::Stream(down_rx))
+        .unwrap()
 }
 
 fn plain(code: StatusCode) -> Response<ResponseBody> {
@@ -474,9 +468,8 @@ impl http_body::Body for ResponseBody {
 
 // ── XhttpStream ───────────────────────────────────────────────────────────────
 
-/// packet-up 序号重排队列（对应 Xray 的 uploadQueue）
 struct PktQueue {
-    heap: BinaryHeap<Reverse<PktEntry>>,
+    heap:     BinaryHeap<Reverse<PktEntry>>,
     next_seq: u64,
     leftover: BytesMut,
 }
@@ -491,16 +484,12 @@ impl PartialOrd for PktEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 
-/// 双向字节流：AsyncRead（上行）+ AsyncWrite（下行）
 pub struct XhttpStream {
-    // 上行
     up_rx:      mpsc::Receiver<UploadPacket>,
     pkt_queue:  PktQueue,
     stream_buf: BytesMut,
     eof:        bool,
-
-    // 下行：PollSender 保证 channel 满时真正挂起，不 busy-loop
-    down_tx: PollSender<bytes::Bytes>,
+    down_tx:    PollSender<bytes::Bytes>,
 }
 
 impl XhttpStream {
@@ -526,25 +515,19 @@ impl AsyncRead for XhttpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-
         loop {
-            // 1. packet-up leftover（当前包未读完的部分）
             if !this.pkt_queue.leftover.is_empty() {
                 let n = this.pkt_queue.leftover.len().min(buf.remaining());
                 buf.put_slice(&this.pkt_queue.leftover[..n]);
                 this.pkt_queue.leftover.advance(n);
                 return Poll::Ready(Ok(()));
             }
-
-            // 2. stream-up 尾部缓冲
             if !this.stream_buf.is_empty() {
                 let n = this.stream_buf.len().min(buf.remaining());
                 buf.put_slice(&this.stream_buf[..n]);
                 this.stream_buf.advance(n);
                 return Poll::Ready(Ok(()));
             }
-
-            // 3. 按序弹出 packet-up 包
             if let Some(Reverse(top)) = this.pkt_queue.heap.peek() {
                 if top.seq == this.pkt_queue.next_seq {
                     let Reverse(entry) = this.pkt_queue.heap.pop().unwrap();
@@ -556,21 +539,11 @@ impl AsyncRead for XhttpStream {
                     this.pkt_queue.next_seq += 1;
                     return Poll::Ready(Ok(()));
                 }
-                // 堆顶不是期望序号，等更多包到来后再弹
             }
-
-            // 4. EOF
-            if this.eof {
-                return Poll::Ready(Ok(()));
-            }
-
-            // 5. 从 up_rx 拿新包，继续循环处理
+            if this.eof { return Poll::Ready(Ok(())); }
             match this.up_rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.eof = true;
-                    return Poll::Ready(Ok(()));
-                }
+                Poll::Ready(None) => { this.eof = true; return Poll::Ready(Ok(())); }
                 Poll::Ready(Some(pkt)) => match pkt {
                     UploadPacket::Chunk(data) => {
                         let n = data.len().min(buf.remaining());
@@ -582,12 +555,8 @@ impl AsyncRead for XhttpStream {
                     }
                     UploadPacket::Packet { seq, data } => {
                         this.pkt_queue.heap.push(Reverse(PktEntry { seq, data }));
-                        // 继续 loop，尝试按序弹出
                     }
-                    UploadPacket::Eof => {
-                        this.eof = true;
-                        return Poll::Ready(Ok(()));
-                    }
+                    UploadPacket::Eof => { this.eof = true; return Poll::Ready(Ok(())); }
                 },
             }
         }
@@ -601,8 +570,6 @@ impl AsyncWrite for XhttpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-
-        // poll_reserve：等 channel 有空位，满时真正挂起（不 busy-loop）
         match this.down_tx.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(_)) => Poll::Ready(Err(
@@ -635,46 +602,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_path_stream_one_no_slash() {
-        assert_eq!(parse_path("/xhttp", "/xhttp/"), Some((None, None)));
-    }
+    fn test_parse_path() {
+        let base = "/vless/";
+        assert_eq!(parse_path("/vless", base),  Some((None, None)));
+        assert_eq!(parse_path("/vless/", base), Some((None, None)));
 
-    #[test]
-    fn test_parse_path_stream_one_with_slash() {
-        assert_eq!(parse_path("/xhttp/", "/xhttp/"), Some((None, None)));
-    }
-
-    #[test]
-    fn test_parse_path_stream_down() {
         let sid = "550e8400-e29b-41d4-a716-446655440000";
-        let p = format!("/xhttp/{sid}");
-        assert_eq!(parse_path(&p, "/xhttp/"), Some((Some(sid.to_string()), None)));
-    }
-
-    #[test]
-    fn test_parse_path_packet_up() {
-        let sid = "550e8400-e29b-41d4-a716-446655440000";
-        let p = format!("/xhttp/{sid}/42");
         assert_eq!(
-            parse_path(&p, "/xhttp/"),
-            Some((Some(sid.to_string()), Some("42".to_string())))
+            parse_path(&format!("/vless/{sid}"), base),
+            Some((Some(sid.into()), None))
         );
+        assert_eq!(
+            parse_path(&format!("/vless/{sid}/42"), base),
+            Some((Some(sid.into()), Some("42".into())))
+        );
+        assert_eq!(parse_path("/other", base), None);
     }
+}
 
-    #[test]
-    fn test_parse_path_bad_prefix() {
-        assert_eq!(parse_path("/other/path", "/xhttp/"), None);
-    }
+// ── 兼容旧 API（vmess / shadowsocks / trojan 使用）────────────────────────────
+//
+// 旧版 accept_plain / accept_tls 是 per-TCP-connection 的。
+// 这些协议（vmess/trojan/ss）只用 stream-one 模式（客户端用同一 TCP 连接发 GET+body），
+// 所以用单连接的 XhttpServer 包装即可。
 
-    #[test]
-    fn test_normalized_path() {
-        let cfg = XhttpConfig { path: "/xhttp".to_string(), host: None };
-        assert_eq!(cfg.normalized_path(), "/xhttp/");
+pub async fn accept_plain(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    cfg: &XhttpConfig,
+) -> Result<XhttpStream> {
+    let srv = XhttpServer::new(cfg.clone());
+    srv.feed_plain(stream, peer);
+    srv.accept().await.ok_or_else(|| anyhow::anyhow!("[xhttp] {peer}: accept channel closed"))
+}
 
-        let cfg2 = XhttpConfig { path: "/xhttp/".to_string(), host: None };
-        assert_eq!(cfg2.normalized_path(), "/xhttp/");
-
-        let cfg3 = XhttpConfig { path: "/".to_string(), host: None };
-        assert_eq!(cfg3.normalized_path(), "/");
-    }
+pub async fn accept_tls<S>(
+    stream: S,
+    peer: SocketAddr,
+    cfg: &XhttpConfig,
+) -> Result<XhttpStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let srv = XhttpServer::new(cfg.clone());
+    srv.feed_tls(stream, peer);
+    srv.accept().await.ok_or_else(|| anyhow::anyhow!("[xhttp] {peer}: accept channel closed"))
 }
