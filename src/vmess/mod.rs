@@ -146,7 +146,7 @@ async fn handle(
 
 async fn process<S>(io: &mut S, peer: SocketAddr, cmd_key: [u8; 16], uuid: [u8; 16]) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized,
 {
     let req = decode_vmess_aead_request(io, &cmd_key, &uuid)
         .await
