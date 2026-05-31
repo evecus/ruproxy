@@ -601,35 +601,6 @@ impl AsyncWrite for XhttpStream {
     }
 }
 
-// ── 兼容旧 API（vmess / shadowsocks / trojan 使用）────────────────────────────
-//
-// 旧版 accept_plain / accept_tls 是 per-TCP-connection 的。
-// 这些协议（vmess/trojan/ss）只用 stream-one 模式（客户端用同一 TCP 连接发 GET+body），
-// 所以用单连接的 XhttpServer 包装即可。
-
-pub async fn accept_plain(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-    cfg: &XhttpConfig,
-) -> Result<XhttpStream> {
-    let srv = XhttpServer::new(cfg.clone());
-    srv.feed_plain(stream, peer);
-    srv.accept().await.ok_or_else(|| anyhow::anyhow!("[xhttp] {peer}: accept channel closed"))
-}
-
-pub async fn accept_tls<S>(
-    stream: S,
-    peer: SocketAddr,
-    cfg: &XhttpConfig,
-) -> Result<XhttpStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let srv = XhttpServer::new(cfg.clone());
-    srv.feed_tls(stream, peer);
-    srv.accept().await.ok_or_else(|| anyhow::anyhow!("[xhttp] {peer}: accept channel closed"))
-}
-
 // ── 单元测试 ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
