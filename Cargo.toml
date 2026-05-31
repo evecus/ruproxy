@@ -55,7 +55,7 @@ rand = "0.8"
 
 # Hyper HTTP server (used by XHTTP/splithttp transport)
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client", "client-legacy"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server", "server-auto", "client", "client-legacy"] }
 http-body-util = "0.1"
 http-body = "1"
 
