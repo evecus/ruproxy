@@ -596,31 +596,6 @@ impl AsyncWrite for XhttpStream {
     }
 }
 
-// ── 单元测试 ───────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_path() {
-        let base = "/vless/";
-        assert_eq!(parse_path("/vless", base),  Some((None, None)));
-        assert_eq!(parse_path("/vless/", base), Some((None, None)));
-
-        let sid = "550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(
-            parse_path(&format!("/vless/{sid}"), base),
-            Some((Some(sid.into()), None))
-        );
-        assert_eq!(
-            parse_path(&format!("/vless/{sid}/42"), base),
-            Some((Some(sid.into()), Some("42".into())))
-        );
-        assert_eq!(parse_path("/other", base), None);
-    }
-}
-
 // ── 兼容旧 API（vmess / shadowsocks / trojan 使用）────────────────────────────
 //
 // 旧版 accept_plain / accept_tls 是 per-TCP-connection 的。
@@ -648,4 +623,29 @@ where
     let srv = XhttpServer::new(cfg.clone());
     srv.feed_tls(stream, peer);
     srv.accept().await.ok_or_else(|| anyhow::anyhow!("[xhttp] {peer}: accept channel closed"))
+}
+
+// ── 单元测试 ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_path() {
+        let base = "/vless/";
+        assert_eq!(parse_path("/vless", base),  Some((None, None)));
+        assert_eq!(parse_path("/vless/", base), Some((None, None)));
+
+        let sid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            parse_path(&format!("/vless/{sid}"), base),
+            Some((Some(sid.into()), None))
+        );
+        assert_eq!(
+            parse_path(&format!("/vless/{sid}/42"), base),
+            Some((Some(sid.into()), Some("42".into())))
+        );
+        assert_eq!(parse_path("/other", base), None);
+    }
 }
