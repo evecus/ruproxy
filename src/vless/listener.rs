@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
-use crate::common::transport::xhttp::{self, XhttpConfig};
+use crate::common::transport::xhttp::{XhttpConfig, XhttpServer};
 use crate::config::{VlessConfig, VlessTlsConfig};
 use crate::vless::protocol::{decode_request, encode_response, parse_uuid, CMD_TCP};
 use crate::vless::tls::reality as vless_reality;
@@ -49,6 +49,81 @@ pub async fn run(cfg: Arc<VlessConfig>) -> Result<()> {
         cfg.transport.r#type,
     );
 
+    // ── xhttp：server 级别，跨 TCP 连接共享 session 表 ────────────────────────
+    if cfg.transport.r#type == "xhttp" {
+        let xh_cfg = XhttpConfig {
+            path: cfg.transport.xhttp_path.clone(),
+            host: cfg.transport.xhttp_host.clone(),
+        };
+        let xhttp_server = XhttpServer::new(xh_cfg);
+
+        // 任务1：接受 TCP 连接，feed 给 xhttp_server
+        let xhttp_server_feed = xhttp_server.clone();
+        let tls_acceptor2 = tls_acceptor.clone();
+        let cfg2 = Arc::clone(&cfg);
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(e) => { warn!("[vless] accept error: {e}"); continue; }
+                };
+                debug!("[vless] New connection from {peer}");
+                match &cfg2.tls {
+                    None => {
+                        debug!("[vless] {peer} → XHTTP");
+                        xhttp_server_feed.feed_plain(stream, peer);
+                    }
+                    Some(VlessTlsConfig::Tls { .. }) => {
+                        debug!("[vless] {peer} → XHTTP+TLS");
+                        let acceptor = match &tls_acceptor2 {
+                            Some(a) => Arc::clone(a),
+                            None => { warn!("[vless] TLS acceptor missing"); continue; }
+                        };
+                        let srv = xhttp_server_feed.clone();
+                        tokio::spawn(async move {
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => srv.feed_tls(tls_stream, peer),
+                                Err(e) => warn!("[vless] {peer} TLS handshake failed: {e}"),
+                            }
+                        });
+                    }
+                    Some(VlessTlsConfig::Reality(reality_cfg)) => {
+                        debug!("[vless] {peer} → XHTTP+Reality");
+                        let reality_cfg = reality_cfg.clone();
+                        let srv = xhttp_server_feed.clone();
+                        tokio::spawn(async move {
+                            match vless_reality::accept(stream, peer, &reality_cfg).await {
+                                Ok(reality_stream) => srv.feed_tls(reality_stream, peer),
+                                Err(e) => warn!("[vless] {peer} Reality handshake failed: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        // 任务2：从 xhttp_server.accept() 取完整逻辑连接，交给 process_vless_stream
+        loop {
+            match xhttp_server.accept().await {
+                None => {
+                    warn!("[vless] xhttp server channel closed");
+                    break;
+                }
+                Some(xhs) => {
+                    tokio::spawn(async move {
+                        // peer 信息在 xhttp 层，这里用占位符
+                        let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        if let Err(e) = process_vless_stream(xhs, peer, uuid_bytes).await {
+                            warn!("[vless] xhttp stream error: {e:#}");
+                        }
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── 其他 transport：per-TCP-connection ────────────────────────────────────
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = Arc::clone(&cfg);
@@ -73,8 +148,6 @@ async fn handle_conn(
     let transport_type = cfg.transport.r#type.as_str();
     let ws_path = cfg.transport.ws_path.as_str();
     let ws_host = cfg.transport.ws_host.as_deref();
-    let xhttp_path = cfg.transport.xhttp_path.as_str();
-    let xhttp_host = cfg.transport.xhttp_host.clone();
 
     match (transport_type, &cfg.tls) {
         // ── TCP, no TLS ───────────────────────────────────────────────────
@@ -123,43 +196,6 @@ async fn handle_conn(
             let reality_stream = vless_reality::accept(stream, peer, reality_cfg).await?;
             let ws = shared_ws::accept_tls(reality_stream, ws_path, ws_host).await?;
             process_vless_stream(ws, peer, uuid_bytes).await
-        }
-        // ── XHTTP, no TLS ────────────────────────────────────────────────
-        ("xhttp", None) => {
-            debug!("[vless] {peer} → XHTTP");
-            let xh_cfg = XhttpConfig {
-                path: xhttp_path.to_string(),
-                host: xhttp_host,
-            };
-            let xh = xhttp::accept_plain(stream, peer, &xh_cfg).await?;
-            process_vless_stream(xh, peer, uuid_bytes).await
-        }
-        // ── XHTTP + standard TLS ──────────────────────────────────────────
-        ("xhttp", Some(VlessTlsConfig::Tls { .. })) => {
-            debug!("[vless] {peer} → XHTTP+TLS");
-            let acceptor =
-                tls_acceptor.ok_or_else(|| anyhow::anyhow!("[vless] TLS acceptor missing"))?;
-            let tls_stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| anyhow::anyhow!("vless XHTTP+TLS handshake failed: {e}"))?;
-            let xh_cfg = XhttpConfig {
-                path: xhttp_path.to_string(),
-                host: xhttp_host,
-            };
-            let xh = xhttp::accept_tls(tls_stream, peer, &xh_cfg).await?;
-            process_vless_stream(xh, peer, uuid_bytes).await
-        }
-        // ── XHTTP + Reality ───────────────────────────────────────────────
-        ("xhttp", Some(VlessTlsConfig::Reality(reality_cfg))) => {
-            debug!("[vless] {peer} → XHTTP+Reality");
-            let reality_stream = vless_reality::accept(stream, peer, reality_cfg).await?;
-            let xh_cfg = XhttpConfig {
-                path: xhttp_path.to_string(),
-                host: xhttp_host,
-            };
-            let xh = xhttp::accept_tls(reality_stream, peer, &xh_cfg).await?;
-            process_vless_stream(xh, peer, uuid_bytes).await
         }
         (other, _) => anyhow::bail!("vless: unknown transport type '{other}'"),
     }
