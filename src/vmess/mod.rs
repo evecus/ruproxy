@@ -18,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::common::tls::standard as shared_tls;
 use crate::common::transport::websocket as shared_ws;
-use crate::common::transport::xhttp::{self, XhttpConfig};
+use crate::common::transport::xhttp::{XhttpConfig, XhttpServer};
 use crate::config::VmessConfig;
 use crate::vless::protocol::parse_uuid;
 
@@ -54,6 +54,57 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("[vmess] Listening on {addr}");
 
+    // ── xhttp：server 级别 session 表 ─────────────────────────────────────────
+    if cfg.transport.r#type == "xhttp" {
+        let xh_cfg = XhttpConfig {
+            path: cfg.transport.xhttp_path.clone(),
+            host: cfg.transport.xhttp_host.clone(),
+        };
+        let xhttp_server = XhttpServer::new(xh_cfg);
+
+        // 任务1：接受 TCP，feed 给 xhttp_server
+        let srv_feed = xhttp_server.clone();
+        let tls2 = tls_acceptor.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(e) => { warn!("[vmess] accept error: {e}"); continue; }
+                };
+                match &tls2 {
+                    None => { srv_feed.feed_plain(stream, peer); }
+                    Some(acc) => {
+                        let acc = Arc::clone(acc);
+                        let srv = srv_feed.clone();
+                        tokio::spawn(async move {
+                            match acc.accept(stream).await {
+                                Ok(tls) => srv.feed_tls(tls, peer),
+                                Err(e) => warn!("[vmess] {peer} TLS: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        // 任务2：accept() 取完整逻辑连接
+        loop {
+            match xhttp_server.accept().await {
+                None => { warn!("[vmess] xhttp server closed"); break; }
+                Some(xhs) => {
+                    tokio::spawn(async move {
+                        let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        if let Err(e) = process(xhs, peer, cmd_key, uuid).await {
+                            warn!("[vmess] {peer}: {e:#}");
+                        }
+                    });
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // ── 其他 transport ────────────────────────────────────────────────────────
     loop {
         let (stream, peer) = listener.accept().await?;
         let cfg2 = Arc::clone(&cfg);
@@ -81,52 +132,31 @@ async fn handle(
         ("tcp", None) => Box::new(stream),
         ("tcp", Some(a)) => Box::new(a.accept(stream).await?),
         ("ws", None) => Box::new(
-            shared_ws::accept_plain(
-                stream,
-                &cfg.transport.ws_path,
-                cfg.transport.ws_host.as_deref(),
-            )
-            .await?,
+            shared_ws::accept_plain(stream, &cfg.transport.ws_path, cfg.transport.ws_host.as_deref()).await?,
         ),
         ("ws", Some(a)) => {
             let tls = a.accept(stream).await?;
-            Box::new(
-                shared_ws::accept_tls(
-                    tls,
-                    &cfg.transport.ws_path,
-                    cfg.transport.ws_host.as_deref(),
-                )
-                .await?,
-            )
-        }
-        ("xhttp", None) => {
-            let xh_cfg = XhttpConfig {
-                path: cfg.transport.xhttp_path.clone(),
-                host: cfg.transport.xhttp_host.clone(),
-            };
-            Box::new(xhttp::accept_plain(stream, peer, &xh_cfg).await?)
-        }
-        ("xhttp", Some(a)) => {
-            let tls = a.accept(stream).await?;
-            let xh_cfg = XhttpConfig {
-                path: cfg.transport.xhttp_path.clone(),
-                host: cfg.transport.xhttp_host.clone(),
-            };
-            Box::new(xhttp::accept_tls(tls, peer, &xh_cfg).await?)
+            Box::new(shared_ws::accept_tls(tls, &cfg.transport.ws_path, cfg.transport.ws_host.as_deref()).await?)
         }
         _ => bail!("bad transport"),
     };
+    process(&mut *io, peer, cmd_key, uuid).await
+}
 
-    let req = decode_vmess_aead_request(&mut io, &cmd_key, &uuid)
+async fn process<S>(io: &mut S, peer: SocketAddr, cmd_key: [u8; 16], uuid: [u8; 16]) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let req = decode_vmess_aead_request(io, &cmd_key, &uuid)
         .await
         .context("decode vmess aead request")?;
     info!("[vmess] {peer} -> {}", req.target);
 
     let outbound = TcpStream::connect(&req.target).await?;
-    encode_vmess_aead_response(&mut io, req.request_body_key, req.request_body_iv).await?;
+    encode_vmess_aead_response(io, req.request_body_key, req.request_body_iv).await?;
 
     let (mut out_r, mut out_w) = outbound.into_split();
-    let (mut in_r, mut in_w) = tokio::io::split(&mut io);
+    let (mut in_r, mut in_w) = tokio::io::split(io);
 
     let uplink = async {
         let _ = tokio::io::copy(&mut in_r, &mut out_w).await;
@@ -151,20 +181,16 @@ async fn decode_vmess_aead_request<S: AsyncRead + Unpin>(
     cmd_key: &[u8; 16],
     _uuid: &[u8; 16],
 ) -> Result<VmessRequest> {
-    // 1. auth_id (16 bytes)
     let mut auth_id = [0u8; 16];
     s.read_exact(&mut auth_id).await?;
     validate_auth_id(&auth_id, cmd_key)?;
 
-    // 2. encrypted length (18 = 2 data + 16 AEAD tag)
     let mut enc_len = [0u8; 18];
     s.read_exact(&mut enc_len).await?;
 
-    // 3. connection nonce (8 bytes)
     let mut nonce = [0u8; 8];
     s.read_exact(&mut nonce).await?;
 
-    // Decrypt length — key/iv derived from cmd_key + salts + auth_id + nonce
     let len_key = kdf16(cmd_key, &[KDF_SALT_HEADER_LEN_KEY, &auth_id, &nonce]);
     let len_iv = kdf12(cmd_key, &[KDF_SALT_HEADER_LEN_IV, &auth_id, &nonce]);
     let plain_len_bytes =
@@ -177,7 +203,6 @@ async fn decode_vmess_aead_request<S: AsyncRead + Unpin>(
         bail!("invalid vmess header length: {header_len}");
     }
 
-    // 4. encrypted header (header_len data + 16 AEAD tag)
     let mut enc_header = vec![0u8; header_len + 16];
     s.read_exact(&mut enc_header).await?;
 
@@ -198,21 +223,18 @@ fn parse_vmess_plain_header(header: &[u8]) -> Result<VmessRequest> {
         bail!("unsupported vmess version: {ver}");
     }
 
-    // header[1..17]  = request body IV  (echoed to client as response body IV seed)
-    // header[17..33] = request body Key
     let mut req_iv = [0u8; 16];
     req_iv.copy_from_slice(&header[1..17]);
     let mut req_key = [0u8; 16];
     req_key.copy_from_slice(&header[17..33]);
 
-    let _response_token = header[33]; // V byte, echoed in response
+    let _response_token = header[33];
     let opt = header[34];
     let pad_len = (header[35] >> 4) as usize;
     let security = header[35] & 0x0f;
     if security != 0x05 && security != 0x03 && security != 0x00 {
         bail!("unsupported security type: {security:#x}");
     }
-    // header[36] = reserved
     let cmd = header[37];
     if cmd != 0x01 {
         bail!("only tcp supported, cmd={cmd:#x}");
@@ -223,31 +245,23 @@ fn parse_vmess_plain_header(header: &[u8]) -> Result<VmessRequest> {
     let atyp = header[40];
     let host = match atyp {
         0x01 => {
-            if header.len() < idx + 4 {
-                bail!("short ipv4")
-            }
+            if header.len() < idx + 4 { bail!("short ipv4") }
             let mut b = [0; 4];
             b.copy_from_slice(&header[idx..idx + 4]);
             idx += 4;
             std::net::Ipv4Addr::from(b).to_string()
         }
         0x02 => {
-            if header.len() < idx + 1 {
-                bail!("short domain len")
-            }
+            if header.len() < idx + 1 { bail!("short domain len") }
             let l = header[idx] as usize;
             idx += 1;
-            if header.len() < idx + l {
-                bail!("short domain")
-            }
+            if header.len() < idx + l { bail!("short domain") }
             let d = String::from_utf8(header[idx..idx + l].to_vec())?;
             idx += l;
             d
         }
         0x03 => {
-            if header.len() < idx + 16 {
-                bail!("short ipv6")
-            }
+            if header.len() < idx + 16 { bail!("short ipv6") }
             let mut b = [0; 16];
             b.copy_from_slice(&header[idx..idx + 16]);
             idx += 16;
@@ -256,11 +270,8 @@ fn parse_vmess_plain_header(header: &[u8]) -> Result<VmessRequest> {
         _ => bail!("unsupported atyp {atyp:#x}"),
     };
 
-    // Skip padding bytes
     idx += pad_len;
 
-    // FIX #2: verify FNV-1a-32 checksum of the header content before the last 4 bytes.
-    // Xray ref: fnv1a.Write(buffer.BytesTo(-4)); compare with buffer.BytesFrom(-4)
     if header.len() < idx + 4 {
         bail!("vmess header missing fnv checksum");
     }
@@ -279,7 +290,6 @@ fn parse_vmess_plain_header(header: &[u8]) -> Result<VmessRequest> {
     })
 }
 
-/// FNV-1a 32-bit hash, identical to Go's hash/fnv.New32a()
 fn fnv1a_32(data: &[u8]) -> u32 {
     const OFFSET_BASIS: u32 = 2166136261;
     const PRIME: u32 = 16777619;
@@ -291,25 +301,11 @@ fn fnv1a_32(data: &[u8]) -> u32 {
     h
 }
 
-/// Encode the VMess AEAD response header, matching Xray's EncodeResponseHeader.
-///
-/// Xray (server.go):
-///   responseBodyKey = SHA256(requestBodyKey)[:16]
-///   responseBodyIV  = SHA256(requestBodyIV)[:16]
-///   payload         = [V, option=0, cmd_len=0, cmd_type=0]  (4 bytes)
-///   lenCT  = AES-GCM(key=KDF16(respKey,"AEAD Resp Header Len Key"),
-///                    nonce=KDF12(respIV,"AEAD Resp Header Len IV"),
-///                    aad=b"", pt=uint16_be(4))
-///   payCT  = AES-GCM(key=KDF16(respKey,"AEAD Resp Header Key"),
-///                    nonce=KDF12(respIV,"AEAD Resp Header IV"),
-///                    aad=b"", pt=payload)
-///   write: lenCT ++ payCT
 async fn encode_vmess_aead_response<S: AsyncWrite + Unpin>(
     s: &mut S,
     request_body_key: [u8; 16],
     request_body_iv: [u8; 16],
 ) -> Result<()> {
-    // FIX #3: derive response key/iv via SHA256 of *request* key/iv
     let resp_key = sha256_16(&request_body_key);
     let resp_iv = sha256_16(&request_body_iv);
 
@@ -318,31 +314,22 @@ async fn encode_vmess_aead_response<S: AsyncWrite + Unpin>(
     let pay_key = kdf16(&resp_key, &[KDF_SALT_AEAD_RESP_HEADER_KEY]);
     let pay_iv = kdf12(&resp_iv, &[KDF_SALT_AEAD_RESP_HEADER_IV]);
 
-    // Payload: [V=0, option=0, 0, 0]  (no commands)
     let payload: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
     let payload_len_be = (payload.len() as u16).to_be_bytes();
 
-    // Encrypted length field (2 bytes plaintext + 16 tag = 18 bytes)
     let enc_len = aead_seal(&payload_len_be, &len_key, &len_iv, b"")?;
     s.write_all(&enc_len).await?;
 
-    // Encrypted payload (4 bytes plaintext + 16 tag = 20 bytes)
     let enc_pay = aead_seal(&payload, &pay_key, &pay_iv, b"")?;
     s.write_all(&enc_pay).await?;
 
     Ok(())
 }
 
-/// Derive the VMess command key from a UUID.
-///
-/// Matches Xray/V2Ray spec: ID.CmdKey() = MD5(uuid || "c48619fe-8f02-49e0-b9e9-edf763e17e21")
-/// The original code incorrectly used SHA256 here, causing all auth_id validation to fail.
 fn vmess_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     md5_two(uuid, b"c48619fe-8f02-49e0-b9e9-edf763e17e21")
 }
 
-/// Minimal MD5 implementation (RFC 1321).
-/// Used only for VMess cmd_key derivation; no crypto security needed.
 fn md5_two(a: &[u8], b: &[u8]) -> [u8; 16] {
     let mut msg = Vec::with_capacity(a.len() + b.len());
     msg.extend_from_slice(a);
@@ -373,9 +360,7 @@ fn md5_hash(input: &[u8]) -> [u8; 16] {
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut msg = input.to_vec();
     msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
+    while msg.len() % 64 != 56 { msg.push(0); }
     msg.extend_from_slice(&bit_len.to_le_bytes());
 
     let (mut a0, mut b0, mut c0, mut d0) =
@@ -399,10 +384,7 @@ fn md5_hash(input: &[u8]) -> [u8; 16] {
             d = c;
             c = b;
             b = b.wrapping_add(
-                a.wrapping_add(f)
-                    .wrapping_add(T[i])
-                    .wrapping_add(m[g])
-                    .rotate_left(S[i]),
+                a.wrapping_add(f).wrapping_add(T[i]).wrapping_add(m[g]).rotate_left(S[i]),
             );
             a = temp;
         }
@@ -426,15 +408,11 @@ fn validate_auth_id(auth_id: &[u8; 16], cmd_key: &[u8; 16]) -> Result<()> {
 
     let checksum = crc32fast::hash(&plain[..12]);
     let stored = u32::from_be_bytes([plain[12], plain[13], plain[14], plain[15]]);
-    if checksum != stored {
-        bail!("invalid auth id");
-    }
+    if checksum != stored { bail!("invalid auth id"); }
 
     let ts = i64::from_be_bytes(plain[..8].try_into().unwrap());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    if (ts - now).abs() > 120 {
-        bail!("invalid auth id");
-    }
+    if (ts - now).abs() > 120 { bail!("invalid auth id"); }
 
     Ok(())
 }
@@ -447,19 +425,6 @@ fn aes128_ecb_decrypt(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
     Ok(out.into())
 }
 
-/// Xray-compatible VMess AEAD KDF.
-///
-/// Go builds a chain of HMAC objects where each layer uses the previous HMAC
-/// *object* as its hash function. For path = [s0, s1]:
-///
-///   h0(m) = HMAC-SHA256(key="VMess AEAD KDF", msg=m)
-///   h1(m) = HMAC-with-h0-as-hash(key=s0, msg=m)
-///   h2(m) = HMAC-with-h1-as-hash(key=s1, msg=m)
-///   result = h2(cmd_key)
-///
-/// FIX #1: Original code used Box<dyn Fn> which cannot be called twice in the
-/// same scope (inner + outer pass of HMAC). Replaced with Arc<dyn Fn> so the
-/// closure can be shared between inner and outer HMAC computations correctly.
 fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     const BLOCK: usize = 64;
     const IPAD: u8 = 0x36;
@@ -468,24 +433,15 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     type HashFn = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
     fn make_layer(hmac_key: &[u8], hash_fn: HashFn) -> HashFn {
-        let k_raw = if hmac_key.len() > BLOCK {
-            hash_fn(hmac_key)
-        } else {
-            hmac_key.to_vec()
-        };
+        let k_raw = if hmac_key.len() > BLOCK { hash_fn(hmac_key) } else { hmac_key.to_vec() };
         let mut k_padded = [0u8; BLOCK];
         k_padded[..k_raw.len()].copy_from_slice(&k_raw);
-
         let ipad: Vec<u8> = k_padded.iter().map(|b| b ^ IPAD).collect();
         let opad: Vec<u8> = k_padded.iter().map(|b| b ^ OPAD).collect();
-
         Arc::new(move |msg: &[u8]| {
-            // inner = hash_fn(ipad ++ msg)
             let mut inner_input = ipad.clone();
             inner_input.extend_from_slice(msg);
             let inner_hash = hash_fn(&inner_input);
-
-            // outer = hash_fn(opad ++ inner)
             let mut outer_input = opad.clone();
             outer_input.extend_from_slice(&inner_hash);
             hash_fn(&outer_input)
@@ -498,13 +454,8 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
         h.finalize().to_vec()
     });
 
-    // Layer 0: HMAC(key="VMess AEAD KDF", hash=sha256)
     let mut h = make_layer(KDF_SALT_VMESS_AEAD_KDF, sha256_fn);
-
-    for salt in path {
-        h = make_layer(salt, h);
-    }
-
+    for salt in path { h = make_layer(salt, h); }
     h(key)
 }
 
