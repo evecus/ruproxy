@@ -71,7 +71,8 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
                     let pw = password.clone();
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        if let Err(e) = process(&mut xhs, peer, &pw).await {
+                        let mut io: Box<dyn AsyncReadWrite> = Box::new(xhs);
+                        if let Err(e) = process(&mut *io, peer, &pw).await {
                             warn!("[trojan] {peer}: {e:#}");
                         }
                     });
@@ -131,7 +132,7 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
-async fn decode_trojan<S: AsyncRead + Unpin>(s: &mut S, password: &str) -> Result<String> {
+async fn decode_trojan<S: AsyncRead + Unpin + ?Sized>(s: &mut S, password: &str) -> Result<String> {
     let mut line = Vec::new();
     loop {
         let b = s.read_u8().await?;
@@ -170,7 +171,7 @@ async fn decode_trojan<S: AsyncRead + Unpin>(s: &mut S, password: &str) -> Resul
     Ok(format!("{host}:{port}"))
 }
 
-async fn relay<S: AsyncRead + AsyncWrite + Unpin>(inbound: &mut S, outbound: TcpStream) -> Result<()> {
+async fn relay<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(inbound: &mut S, outbound: TcpStream) -> Result<()> {
     let (mut or, mut ow) = outbound.into_split();
     let (mut ir, mut iw) = tokio::io::split(inbound);
     let a = async {
