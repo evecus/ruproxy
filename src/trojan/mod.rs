@@ -71,7 +71,7 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
                     let pw = password.clone();
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        if let Err(e) = process(xhs, peer, &pw).await {
+                        if let Err(e) = process(&mut xhs, peer, &pw).await {
                             warn!("[trojan] {peer}: {e:#}");
                         }
                     });
@@ -117,7 +117,7 @@ async fn handle(
     process(&mut *io, peer, &cfg.password).await
 }
 
-async fn process<S: AsyncRead + AsyncWrite + Unpin>(
+async fn process<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     io: &mut S,
     peer: SocketAddr,
     password: &str,
