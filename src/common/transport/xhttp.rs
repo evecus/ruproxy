@@ -191,25 +191,29 @@ async fn get_or_create_session(
     }));
     map.insert(session_id.to_string(), Arc::clone(&session));
 
-    // TTL：30s 内 GET 未到则清理
+    // TTL：30s 内 GET 未到则清理；GET 到达后再等 300s（连接存活期）再清理
     let inner2 = Arc::clone(inner);
     let sid = session_id.to_string();
     tokio::spawn(async move {
-        let timed_out = tokio::time::timeout(
+        let get_timed_out = tokio::time::timeout(
             Duration::from_secs(30),
             get_arrived.notified(),
         ).await.is_err();
 
-        if timed_out {
-            debug!("[xhttp] session {sid} TTL expired, cleaning up");
+        if get_timed_out {
+            // GET 30s 内未到，直接清理
+            debug!("[xhttp] session {sid} TTL expired (no GET)");
             let mut map = inner2.sessions.lock().await;
             if let Some(s) = map.remove(&sid) {
-                // 发送 EOF 给可能正在等待的 XhttpStream
                 let s = s.lock().await;
                 let _ = s.up_tx.send(UploadPacket::Eof).await;
             }
+        } else {
+            // GET 已到达，再等 300s 后清理（正常连接早已结束，这只是防内存泄漏的兜底）
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            debug!("[xhttp] session {sid} cleaned up after connection lifetime");
+            inner2.sessions.lock().await.remove(&sid);
         }
-        // GET 到达时 session 已从 map 移除（由 handle_get 负责），这里无需操作
     });
 
     session
@@ -337,10 +341,11 @@ async fn handle_get(
     };
     let down_tx = session.down_tx.clone();
 
-    // 通知 TTL 任务退出，并从 session 表移除
+    // 通知 TTL 任务：GET 已到达
     session.get_arrived.notify_one();
     drop(session);
-    inner.sessions.lock().await.remove(sid);
+    // 不从 map 移除 session！up_tx 留在 session 里，后续 POST 仍可通过 map 拿到。
+    // session 的清理由 TTL 任务负责（GET 到达后 TTL 会延长到连接超时）。
 
     // 构造 XhttpStream，推入 ready_tx
     let xhs = XhttpStream::new(up_rx, down_tx);
