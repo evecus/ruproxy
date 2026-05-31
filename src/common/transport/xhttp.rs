@@ -1,46 +1,55 @@
 //! XHTTP (SplitHTTP) transport — server-side accept.
 //!
-//! ## 修复说明（对照 Xray splithttp hub.go）
+//! ## 与 Xray splithttp hub.go 的对齐说明
 //!
-//! ### 原版三个核心 Bug
+//! ### Xray 默认行为（mode = "auto" → "packet-up"，无 Reality 时）
 //!
-//! 1. **accept 永久阻塞**
-//!    原版 `accept_hyper` 死等 `ready_rx.await`，要求 GET 请求必须先于 POST 到达。
-//!    但 xhttp 协议不保证顺序，POST 先到时连接永久挂死。
-//!    ✔ 新版：GET handler 到达时通过 `Notify` 通知 accept，accept 仅等待 GET 就绪
-//!    （30s 超时），GET/POST 顺序无关。
+//! URL 结构（sessionPlacement=path, seqPlacement=path 为默认值）：
+//!   GET  /<basepath>/<sessionId>          → downlink（流式响应体）
+//!   POST /<basepath>/<sessionId>/<seq>    → packet-up（带序号的单包）
+//!   POST /<basepath>/<sessionId>          → stream-up（无序号，流式 body）
+//!   GET  /<basepath>                      → stream-one（无 sessionId）
 //!
-//! 2. **Mutex 跨 await 持锁**
-//!    原版用 `Arc<Mutex<Receiver>>` 在 GET handler 持锁跨 await，有死锁风险。
-//!    ✔ 新版：down_rx 存在 `ServiceShared` 里，GET handler 直接 take() 独占，
-//!    不共享，不加锁跨 await。
+//! ### 原版 ruproxy xhttp.rs 的核心问题
 //!
-//! 3. **poll_write busy-loop**
-//!    原版 channel 满时 `wake_by_ref() + Pending` = CPU 忙等，可能饿死其他任务。
-//!    ✔ 新版：改用 `tokio_util::sync::PollSender`，channel 满时真正挂起。
+//! 原版把每个 TCP 连接当作一个独立的 session，在 HTTP 层没有 session 管理：
+//!   - 没有解析 sessionId：GET/<base>/<sid> 和 POST/<base>/<sid> 无法对应
+//!   - accept_hyper 等待一个 GET，但 packet-up 模式下 POST 会先到达（甚至只有 POST）
+//!   - path 解析逻辑错误：Xray 路径是 /<base>/<sid>[/<seq>]，原版解析的格式不同
 //!
-//! ### 新增（对齐 Xray）
+//! ### 本次修复内容
 //!
-//! - **stream-up**：POST body 整体作为持续流（无序号）
-//! - **packet-up**：POST `<path>/<session>/<seq>` 带序号分包，最小堆重排
-//!   （对应 Xray 的 `uploadQueue`）
+//! 1. **Session 表**
+//!    用 `Arc<Mutex<HashMap<String, Arc<Notify>>>>` 追踪已知 sessionId。
+//!    每个 session 有一个 `Notify`，GET handler 到达时触发，供 TTL 清理用。
+//!    核心的 up_tx / down_rx 仍然是全局唯一的（每个 TCP 连接一对），
+//!    因为 accept_hyper 只返回一个 XhttpStream，所有 session 共享同一上下行通道。
+//!
+//! 2. **Path 解析修正**（对齐 Xray ExtractMetaFromRequest）
+//!    /<basepath>/<sessionId>          → session_id=Some, seq=None
+//!    /<basepath>/<sessionId>/<seq>    → session_id=Some, seq=Some
+//!    /<basepath>                      → session_id=None  (stream-one)
+//!
+//! 3. **Session TTL**
+//!    POST 先到时创建 session 记录并启动 30s TTL；
+//!    GET 到达时通知 TTL goroutine 退出，防止内存泄漏。
+//!
+//! 4. **accept_hyper 等待逻辑修正**
+//!    等待 GET 就绪通知（无论 GET/POST 谁先到），超时 30s。
 //!
 //! ### 数据流
 //!
 //! ```text
-//!  客户端 POST ──► [up_tx → up_rx] ──► XhttpStream::poll_read
-//!  XhttpStream::poll_write ──► [down_tx → down_rx] ──► GET response body (StreamBody)
+//!  客户端 POST ──► handle_post ──► up_tx ──► up_rx ──► XhttpStream::poll_read
+//!  XhttpStream::poll_write ──► down_tx ──► down_rx ──► GET response body (StreamBody)
 //! ```
-//!
-//! `accept_hyper` 创建这两对 channel；`down_rx` 由 GET handler 独占作为 response
-//! body，`down_tx` 由 `XhttpStream` 持有用于写下行数据。
 
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use http_body_util::BodyExt;
 use hyper::{Method, Request, Response, StatusCode};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,7 +57,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, oneshot};
 use tokio_util::sync::PollSender;
 use tracing::{debug, warn};
 
@@ -67,9 +76,11 @@ impl Default for XhttpConfig {
 }
 
 impl XhttpConfig {
+    /// 返回规范化后的 base path，末尾统一带 '/'
     pub fn normalized_path(&self) -> String {
         let p = self.path.trim_end_matches('/');
-        if p.starts_with('/') { p.to_string() } else { format!("/{p}") }
+        let p = if p.starts_with('/') { p.to_string() } else { format!("/{p}") };
+        format!("{p}/")
     }
 }
 
@@ -104,30 +115,34 @@ async fn accept_hyper<IO>(io: IO, peer: SocketAddr, cfg: &XhttpConfig) -> Result
 where
     IO: hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
 {
-    let path = cfg.normalized_path();
+    let base_path = cfg.normalized_path();
     let host = cfg.host.clone();
 
-    // 上行 channel：HTTP handler (POST) → XhttpStream 读端
+    // 上行 channel：HTTP POST handler → XhttpStream 读端
     let (up_tx, up_rx) = mpsc::channel::<UploadPacket>(64);
 
     // 下行 channel：XhttpStream 写端 → GET response body
-    // down_tx 由 XhttpStream 持有，down_rx 由 GET handler 独占作为 StreamBody。
     let (down_tx, down_rx) = mpsc::channel::<bytes::Bytes>(64);
 
-    // GET handler 取走 down_rx 后，通过 oneshot 告知 accept 可以继续
+    // GET handler 取走 down_rx 后通知 accept 可以继续
     let (get_done_tx, get_done_rx) = oneshot::channel::<()>();
 
-    // GET 到达通知（先于 get_done，保证 accept 能及时唤醒）
+    // GET 到达通知
     let get_ready = Arc::new(Notify::new());
-    let get_ready_srv = Arc::clone(&get_ready);
+
+    // Session 表：记录已见到的 sessionId，每个 session 有 get_arrived Notify
+    // 用于 POST 先到时启动 TTL，GET 到达时取消 TTL
+    let sessions: Arc<Mutex<HashMap<String, Arc<Notify>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let shared = Arc::new(ServiceShared {
-        path,
+        base_path,
         host,
         up_tx: up_tx.clone(),
-        // down_rx 和 get_done_tx 存在 Mutex 里，只被 GET handler 取一次
-        down_rx: tokio::sync::Mutex::new(Some((down_rx, get_done_tx))),
-        get_ready: get_ready_srv,
+        down_rx_slot: Mutex::new(Some((down_rx, get_done_tx))),
+        get_ready: Arc::clone(&get_ready),
+        down_tx_clone: down_tx,
+        sessions,
     });
 
     tokio::spawn({
@@ -157,21 +172,62 @@ where
         .await
         .map_err(|_| anyhow::anyhow!("[xhttp] {peer}: timeout waiting for GET downlink"))?;
 
-    // 等 GET handler 确认已取走 down_rx（防止 XhttpStream 写入时 receiver 未就绪）
+    // 等 GET handler 确认已取走 down_rx
     let _ = tokio::time::timeout(Duration::from_millis(200), get_done_rx).await;
 
-    Ok(XhttpStream::new(up_rx, down_tx))
+    Ok(XhttpStream::new(up_rx, shared.down_tx_clone.clone()))
 }
 
 // ── 服务端共享状态 ─────────────────────────────────────────────────────────────
 
 struct ServiceShared {
-    path: String,
+    base_path: String,
     host: Option<String>,
     up_tx: mpsc::Sender<UploadPacket>,
-    /// GET handler 从这里 take() down_rx 和 get_done_tx（只取一次）
-    down_rx: tokio::sync::Mutex<Option<(mpsc::Receiver<bytes::Bytes>, oneshot::Sender<()>)>>,
+    /// 第一个 GET handler 从这里取走 (down_rx, get_done_tx)（只取一次）
+    down_rx_slot: Mutex<Option<(mpsc::Receiver<bytes::Bytes>, oneshot::Sender<()>)>>,
+    /// GET 到达通知（通知 accept_hyper）
     get_ready: Arc<Notify>,
+    /// 供 XhttpStream 写端使用的下行 sender clone
+    down_tx_clone: mpsc::Sender<bytes::Bytes>,
+    /// Session 表：sessionId → get_arrived Notify
+    sessions: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+// ── 路径解析 ───────────────────────────────────────────────────────────────────
+
+/// 从请求路径中解析 (session_id, seq_str)。
+///
+/// Xray 默认 sessionPlacement=path, seqPlacement=path：
+///   /<basepath>/<sessionId>          → (Some(sessionId), None)
+///   /<basepath>/<sessionId>/<seq>    → (Some(sessionId), Some(seq))
+///   /<basepath> 或 /<basepath>/      → (None, None)  ← stream-one
+///
+/// 返回 None 表示 path 不匹配 base_path，应返回 404。
+fn parse_path(req_path: &str, base_path: &str) -> Option<(Option<String>, Option<String>)> {
+    // base_path 末尾有 '/'，例如 "/xhttp/"
+    // req_path 可能是 "/xhttp"（stream-one, 无 trailing slash）
+    let base_no_slash = base_path.trim_end_matches('/');
+
+    let rest = if req_path == base_no_slash || req_path == base_path {
+        // stream-one 或 /<base>/
+        ""
+    } else if let Some(s) = req_path.strip_prefix(base_path) {
+        // /<base>/<rest>
+        s.trim_start_matches('/')
+    } else {
+        return None; // 路径不匹配
+    };
+
+    if rest.is_empty() {
+        return Some((None, None));
+    }
+
+    // rest 形如 "<sessionId>" 或 "<sessionId>/<seq>"
+    let mut parts = rest.splitn(2, '/');
+    let session_id = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
+    let seq = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
+    Some((session_id, seq))
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────────────────────────────────
@@ -193,39 +249,81 @@ async fn handle_request(
         }
     }
 
-    // Path 校验，在借用 req 结束前把需要的信息复制成 owned 值
-    let (is_get, seq_str): (bool, Option<String>) = {
-        let req_path = req.uri().path();
-        if !req_path.starts_with(shared.path.as_str()) {
-            warn!("[xhttp] {peer} bad path: {req_path}");
-            return plain(StatusCode::NOT_FOUND);
-        }
-        let suffix = req_path[shared.path.len()..].trim_start_matches('/');
-        let seq_owned = suffix.split_once('/').map(|x| x.1.to_owned());
-        (*req.method() == Method::GET, seq_owned)
-    };
-
     // CORS preflight
     if *req.method() == Method::OPTIONS {
         return cors_ok();
     }
 
-    if is_get {
-        handle_get(shared, peer).await
+    // Path 解析
+    let req_path = req.uri().path().to_string();
+    let (session_id, seq_str) = match parse_path(&req_path, &shared.base_path) {
+        Some(p) => p,
+        None => {
+            warn!("[xhttp] {peer} bad path: {req_path} (base={})", shared.base_path);
+            return plain(StatusCode::NOT_FOUND);
+        }
+    };
+
+    // 路由：GET 无 seq → downlink/stream-one；其他 → uplink
+    let is_downlink = *req.method() == Method::GET && seq_str.is_none();
+
+    if is_downlink {
+        handle_get(req, shared, session_id.as_deref(), peer).await
     } else {
-        handle_post(req, shared, seq_str.as_deref(), peer).await
+        handle_post(req, shared, session_id.as_deref(), seq_str.as_deref(), peer).await
     }
 }
 
-/// GET handler：取走 down_rx 作为 response body，然后通知 accept 就绪
-async fn handle_get(shared: &Arc<ServiceShared>, peer: SocketAddr) -> Response<ResponseBody> {
-    debug!("[xhttp] {peer} GET downlink");
+/// GET handler：downlink 或 stream-one
+async fn handle_get(
+    req: Request<hyper::body::Incoming>,
+    shared: &Arc<ServiceShared>,
+    session_id: Option<&str>,
+    peer: SocketAddr,
+) -> Response<ResponseBody> {
+    debug!("[xhttp] {peer} GET downlink session={session_id:?}");
 
-    let taken = shared.down_rx.lock().await.take();
+    // 若有 sessionId，通知对应 session 的 TTL 任务可以退出
+    if let Some(sid) = session_id {
+        let mut smap = shared.sessions.lock().await;
+        let notify = smap.entry(sid.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        // 通知 TTL 任务：GET 已到，无需清理
+        notify.notify_one();
+        drop(smap);
+    }
+
+    // stream-one：无 sessionId，把 request body 作为上行数据
+    if session_id.is_none() {
+        let up_tx = shared.up_tx.clone();
+        let mut body = req.into_body();
+        tokio::spawn(async move {
+            loop {
+                match body.frame().await {
+                    None => break,
+                    Some(Ok(frame)) => {
+                        if let Ok(data) = frame.into_data() {
+                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        debug!("[xhttp] {peer} stream-one up frame error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // 取出 down_rx slot（只有第一个 GET 能取到）
+    let taken = shared.down_rx_slot.lock().await.take();
     let (down_rx, done_tx) = match taken {
         Some(pair) => pair,
         None => {
-            warn!("[xhttp] {peer} duplicate GET or GET before setup");
+            warn!("[xhttp] {peer} duplicate GET or no down_rx slot");
             return plain(StatusCode::CONFLICT);
         }
     };
@@ -244,14 +342,39 @@ async fn handle_get(shared: &Arc<ServiceShared>, peer: SocketAddr) -> Response<R
         .unwrap()
 }
 
-/// POST/PUT handler：接收上行数据，转发到 up_tx
+/// POST/PUT handler：接收上行数据
 async fn handle_post(
     req: Request<hyper::body::Incoming>,
     shared: &Arc<ServiceShared>,
+    session_id: Option<&str>,
     seq_str: Option<&str>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
-    debug!("[xhttp] {peer} {} uplink seq={:?}", req.method(), seq_str);
+    debug!("[xhttp] {peer} {} uplink session={session_id:?} seq={seq_str:?}", req.method());
+
+    // POST 先到时，在 session 表中创建记录，并启动 30s TTL
+    // 如果 GET 在 30s 内到达，TTL 任务会被通知提前退出
+    if let Some(sid) = session_id {
+        let mut smap = shared.sessions.lock().await;
+        if !smap.contains_key(sid) {
+            let get_arrived = Arc::new(Notify::new());
+            smap.insert(sid.to_string(), Arc::clone(&get_arrived));
+            // 启动 TTL 任务（仅做日志，实际上连接关闭会自动清理）
+            let sid_owned = sid.to_string();
+            let sessions2 = Arc::clone(&shared.sessions);
+            tokio::spawn(async move {
+                // 等待 GET 到达，或 30s 超时
+                let timed_out = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    get_arrived.notified(),
+                ).await.is_err();
+                if timed_out {
+                    debug!("[xhttp] session {sid_owned} TTL expired (GET never arrived)");
+                    sessions2.lock().await.remove(&sid_owned);
+                }
+            });
+        }
+    }
 
     let up_tx = shared.up_tx.clone();
 
@@ -355,7 +478,7 @@ impl http_body::Body for ResponseBody {
 struct PktQueue {
     heap: BinaryHeap<Reverse<PktEntry>>,
     next_seq: u64,
-    leftover: BytesMut, // 当前包未读完的尾部
+    leftover: BytesMut,
 }
 
 #[derive(Eq, PartialEq)]
@@ -373,7 +496,7 @@ pub struct XhttpStream {
     // 上行
     up_rx:      mpsc::Receiver<UploadPacket>,
     pkt_queue:  PktQueue,
-    stream_buf: BytesMut, // stream-up 未读完的尾部
+    stream_buf: BytesMut,
     eof:        bool,
 
     // 下行：PollSender 保证 channel 满时真正挂起，不 busy-loop
@@ -502,5 +625,56 @@ impl AsyncWrite for XhttpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+// ── 单元测试 ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_path_stream_one_no_slash() {
+        assert_eq!(parse_path("/xhttp", "/xhttp/"), Some((None, None)));
+    }
+
+    #[test]
+    fn test_parse_path_stream_one_with_slash() {
+        assert_eq!(parse_path("/xhttp/", "/xhttp/"), Some((None, None)));
+    }
+
+    #[test]
+    fn test_parse_path_stream_down() {
+        let sid = "550e8400-e29b-41d4-a716-446655440000";
+        let p = format!("/xhttp/{sid}");
+        assert_eq!(parse_path(&p, "/xhttp/"), Some((Some(sid.to_string()), None)));
+    }
+
+    #[test]
+    fn test_parse_path_packet_up() {
+        let sid = "550e8400-e29b-41d4-a716-446655440000";
+        let p = format!("/xhttp/{sid}/42");
+        assert_eq!(
+            parse_path(&p, "/xhttp/"),
+            Some((Some(sid.to_string()), Some("42".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_parse_path_bad_prefix() {
+        assert_eq!(parse_path("/other/path", "/xhttp/"), None);
+    }
+
+    #[test]
+    fn test_normalized_path() {
+        let cfg = XhttpConfig { path: "/xhttp".to_string(), host: None };
+        assert_eq!(cfg.normalized_path(), "/xhttp/");
+
+        let cfg2 = XhttpConfig { path: "/xhttp/".to_string(), host: None };
+        assert_eq!(cfg2.normalized_path(), "/xhttp/");
+
+        let cfg3 = XhttpConfig { path: "/".to_string(), host: None };
+        assert_eq!(cfg3.normalized_path(), "/");
     }
 }
