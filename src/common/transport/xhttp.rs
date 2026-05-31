@@ -359,7 +359,8 @@ async fn handle_post(
 ) -> Response<ResponseBody> {
     let up_tx = if let Some(sid) = session_id {
         let session_arc = get_or_create_session(inner, sid).await;
-        session_arc.lock().await.up_tx.clone()
+        let up_tx = session_arc.lock().await.up_tx.clone();
+        up_tx
     } else {
         // POST 无 sessionId 不常见，忽略
         warn!("[xhttp] {peer} POST without sessionId");
