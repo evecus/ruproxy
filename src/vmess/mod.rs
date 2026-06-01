@@ -565,12 +565,12 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
 
     let mut mac = <HmacSha256 as Mac>::new_from_slice(KDF_ROOT).unwrap();
-    mac.update(key);
+    Mac::update(&mut mac, key);
     let mut h: Vec<u8> = mac.finalize().into_bytes().to_vec();
 
     for salt in path {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(salt).unwrap();
-        mac.update(&h);
+        Mac::update(&mut mac, &h);
         h = mac.finalize().into_bytes().to_vec();
     }
     h
