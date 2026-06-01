@@ -374,23 +374,21 @@ async fn handle_post(
 
     match seq_str {
         None => {
-            // stream-up: MUST block here (keep the HTTP handler alive) so hyper
-            // does not tear down the request body before all data has been read.
-            // Spawning + immediate return would close the connection prematurely.
+            // stream-up
             let mut body = req.into_body();
-            loop {
-                match body.frame().await {
-                    None => break,
-                    Some(Ok(frame)) => {
-                        if let Ok(data) = frame.into_data() {
-                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
+            tokio::spawn(async move {
+                loop {
+                    match body.frame().await {
+                        None => break,
+                        Some(Ok(frame)) => {
+                            if let Ok(data) = frame.into_data() {
+                                if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
+                            }
                         }
+                        Some(Err(e)) => { debug!("[xhttp] {peer} stream-up: {e}"); break; }
                     }
-                    Some(Err(e)) => { debug!("[xhttp] {peer} stream-up: {e}"); break; }
                 }
-            }
-            // Signal EOF so the consumer (e.g. vmess relay_up) sees end-of-stream.
-            let _ = up_tx.send(UploadPacket::Eof).await;
+            });
         }
         Some(s) => {
             // packet-up
