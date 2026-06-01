@@ -167,7 +167,7 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     io: &mut S, peer: SocketAddr, cmd_key: [u8; 16],
 ) -> Result<()> {
     let req = decode_request_header(io, &cmd_key).await.context("decode header")?;
-    info!("[vmess] {peer} -> {}", req.target);
+    info!("[vmess] {peer} -> {} (sec={:#x} opt={:#x})", req.target, req.security, req.option);
 
     let outbound = TcpStream::connect(&req.target).await?;
     encode_response_header(io, &req).await?;
@@ -310,6 +310,7 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         tokio::io::copy(r, w).await?;
         return Ok(());
     }
+    tracing::debug!("[vmess] relay_down sec={sec:#x} opt={opt:#x} masking={} auth_len={}", opt & OPT_CHUNK_MASKING != 0, opt & OPT_AUTH_LEN != 0);
 
     let use_masking  = opt & OPT_CHUNK_MASKING != 0;
     let use_auth_len = opt & OPT_AUTH_LEN != 0;
