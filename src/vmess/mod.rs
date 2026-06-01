@@ -389,7 +389,7 @@ fn padding_len(shake: &mut Option<Shake128Reader>) -> usize {
 fn chacha_key(key: &[u8; 16]) -> [u8; 32] {
     use md5::{Digest as _, Md5};
     let h1 = Md5::digest(key);
-    let h2 = Md5::digest(&h1);
+    let h2 = Md5::digest(h1);
     let mut out = [0u8; 32];
     out[..16].copy_from_slice(&h1);
     out[16..].copy_from_slice(&h2);
