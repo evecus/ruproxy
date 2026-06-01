@@ -563,10 +563,10 @@ fn aes128_ecb_decrypt(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
 // HMAC(K, M) with custom hash H = H(K^opad || H(K^ipad || M))
 
 fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
-    const BLOCK: usize = 64; // SHA-256 block size
+    type KdfFn = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+    const BLOCK: usize = 64;
 
-    // f0: standard HMAC-SHA256(key=KDF_ROOT)
-    let f0: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(|msg: &[u8]| {
+    let f0: KdfFn = Box::new(|msg: &[u8]| {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(KDF_ROOT).unwrap();
@@ -575,7 +575,7 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     });
 
     // Iteratively wrap with each path salt
-    let mut f: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = f0;
+    let mut f: KdfFn = f0;
     for &salt in path {
         // Pad salt to block size
         let mut salt_padded = [0u8; BLOCK];
@@ -586,7 +586,7 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
         let opad: Vec<u8> = salt_padded.iter().map(|b| b ^ 0x5c).collect();
 
         let prev = f;
-        f = Box::new(move |msg: &[u8]| {
+        let next: KdfFn = Box::new(move |msg: &[u8]| {
             let mut inner_msg = ipad.clone();
             inner_msg.extend_from_slice(msg);
             let inner = prev(&inner_msg);
@@ -595,6 +595,7 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
             outer_msg.extend_from_slice(&inner);
             prev(&outer_msg)
         });
+        f = next;
     }
 
     f(key)
