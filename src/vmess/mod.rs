@@ -192,8 +192,9 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     let dn = {
         let k = req.response_body_key;
         let v = req.response_body_iv;
+        let req_iv = req.request_body_iv;
         async move {
-            if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, opt, sec).await {
+            if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, req_iv, opt, sec).await {
                 tracing::debug!("[vmess] dn: {e}");
             }
             let _ = in_w.shutdown().await;
@@ -224,11 +225,14 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
     let use_padding = opt & OPT_GLOBAL_PADDING != 0;
 
     let mut shake_size = use_masking.then(|| Shake128Reader::new(&iv));
+    // auth_len and data use INDEPENDENT counters (xray: each gets its own
+    // GenerateChunkNonce instance starting at 0; sharing one counter is wrong)
     let mut count: u16 = 0;
+    let mut auth_len_count: u16 = 0;
 
-    // auth_len uses a separate AES-GCM cipher for the length field
+    // auth_len uses a separate AES-GCM cipher and independent nonce counter
     let auth_len_key = use_auth_len.then(|| kdf16(&key, &[b"auth_len"]));
-    let auth_len_iv_seed = iv; // nonce derived per chunk
+    // auth_len nonce uses requestBodyIV (same iv as data) but independent counter
 
     loop {
         // ── Read size field ───────────────────────────────────────────────
@@ -236,11 +240,11 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
             // 18 bytes = 2 plaintext + 16 GCM tag
             let mut buf = [0u8; 18];
             r.read_exact(&mut buf).await?;
-            let nonce = chunk_nonce(&auth_len_iv_seed, count);
+            let nonce = chunk_nonce(&iv, auth_len_count);
             let lc = Aes128Gcm::new_from_slice(&auth_len_key.unwrap())?;
             let plain = lc.decrypt(Nonce::from_slice(&nonce), buf.as_ref())
                 .map_err(|_| anyhow!("auth_len decrypt"))?;
-            count = count.wrapping_add(1);
+            auth_len_count = auth_len_count.wrapping_add(1);
             u16::from_be_bytes([plain[0], plain[1]]) as usize
         } else {
             let mut buf = [0u8; 2];
@@ -302,6 +306,7 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
 async fn relay_down<R, W>(
     r: &mut R, w: &mut W,
     key: [u8; 16], iv: [u8; 16],
+    req_iv: [u8; 16],   // requestBodyIV — used for auth_len nonce (xray compat)
     opt: u8, sec: u8,
 ) -> Result<()>
 where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
@@ -315,7 +320,9 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
     let use_auth_len = opt & OPT_AUTH_LEN != 0;
 
     let mut shake_size = use_masking.then(|| Shake128Reader::new(&iv));
+    // Independent counters for data and auth_len (matching xray behavior)
     let mut count: u16 = 0;
+    let mut auth_len_count: u16 = 0;
     let auth_len_key = use_auth_len.then(|| kdf16(&key, &[b"auth_len"]));
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -350,12 +357,13 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         let data_len = ct.len() as u16;
 
         // Write size field
+        // auth_len uses requestBodyIV (req_iv) and its own independent counter
         if use_auth_len {
-            let nonce = chunk_nonce(&iv, count); // use next count for len
+            let nonce = chunk_nonce(&req_iv, auth_len_count);
             let lc = Aes128Gcm::new_from_slice(&auth_len_key.unwrap())?;
             let enc_len = lc.encrypt(Nonce::from_slice(&nonce), data_len.to_be_bytes().as_ref())
                 .map_err(|_| anyhow!("len encrypt"))?;
-            count = count.wrapping_add(1);
+            auth_len_count = auth_len_count.wrapping_add(1);
             w.write_all(&enc_len).await?;
         } else if let Some(ref mut sk) = shake_size {
             w.write_all(&(data_len ^ sk.next_u16()).to_be_bytes()).await?;
