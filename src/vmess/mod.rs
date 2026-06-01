@@ -565,17 +565,18 @@ fn aes128_ecb_decrypt(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
 fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
+    type KdfFn = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
     const BLOCK: usize = 64; // SHA-256 block size
 
     // f0: standard HMAC-SHA256(key=KDF_ROOT)
-    let f0: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(|msg: &[u8]| {
+    let f0: KdfFn = Box::new(|msg: &[u8]| {
         let mut mac = <HmacSha256 as Mac>::new_from_slice(KDF_ROOT).unwrap();
         Mac::update(&mut mac, msg);
         mac.finalize().into_bytes().to_vec()
     });
 
     // Iteratively wrap with each path salt
-    let mut f: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = f0;
+    let mut f: KdfFn = f0;
     for &salt in path {
         // Normalize salt to block size (standard HMAC key normalization)
         let mut salt_padded = [0u8; BLOCK];
@@ -583,8 +584,7 @@ fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
             salt.to_vec()
         } else {
             // hash with current f if salt is too long (shouldn't happen in practice)
-            let h = f(salt);
-            h
+            f(salt)
         };
         let copy_len = salt_bytes.len().min(BLOCK);
         salt_padded[..copy_len].copy_from_slice(&salt_bytes[..copy_len]);
