@@ -552,28 +552,61 @@ fn aes128_ecb_decrypt(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
     Ok(out.into())
 }
 
-// ── KDF (Xray HMAC-SHA256 chain) ──────────────────────────────────────────────
+// ── KDF (Xray HMAC-SHA256 nested structure) ──────────────────────────────────
 //
 // Xray KDF(key, path...):
-//   h = HMAC-SHA256(KDF_ROOT)(key)          // outer key = KDF_ROOT
-//   for each salt in path:
-//     h = HMAC-SHA256(salt)(h)
-//   return h
+//   f0(msg) = HMAC-SHA256(key=KDF_ROOT, msg)          // standard HMAC-SHA256
+//   f_i(msg) = f_{i-1}(salt_i^opad || f_{i-1}(salt_i^ipad || msg))
+//   result = f_n(key_input)
+//
+// Each step wraps the previous function as the "hash function" for a new HMAC.
+// HMAC(K, M) with custom hash H = H(K^opad || H(K^ipad || M))
 
 fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
+    const BLOCK: usize = 64; // SHA-256 block size
 
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(KDF_ROOT).unwrap();
-    Mac::update(&mut mac, key);
-    let mut h: Vec<u8> = mac.finalize().into_bytes().to_vec();
+    // f0: standard HMAC-SHA256(key=KDF_ROOT)
+    let f0: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = Box::new(|msg: &[u8]| {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(KDF_ROOT).unwrap();
+        Mac::update(&mut mac, msg);
+        mac.finalize().into_bytes().to_vec()
+    });
 
-    for salt in path {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(salt).unwrap();
-        Mac::update(&mut mac, &h);
-        h = mac.finalize().into_bytes().to_vec();
+    // Iteratively wrap with each path salt
+    let mut f: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync> = f0;
+    for &salt in path {
+        // Normalize salt to block size (standard HMAC key normalization)
+        let mut salt_padded = [0u8; BLOCK];
+        let salt_bytes = if salt.len() <= BLOCK {
+            salt.to_vec()
+        } else {
+            // hash with current f if salt is too long (shouldn't happen in practice)
+            let h = f(salt);
+            h
+        };
+        let copy_len = salt_bytes.len().min(BLOCK);
+        salt_padded[..copy_len].copy_from_slice(&salt_bytes[..copy_len]);
+
+        let ipad: Vec<u8> = salt_padded.iter().map(|b| b ^ 0x36).collect();
+        let opad: Vec<u8> = salt_padded.iter().map(|b| b ^ 0x5c).collect();
+
+        let prev = f;
+        f = Box::new(move |msg: &[u8]| {
+            // inner = prev(ipad || msg)
+            let mut inner_msg = ipad.clone();
+            inner_msg.extend_from_slice(msg);
+            let inner = prev(&inner_msg);
+
+            // outer = prev(opad || inner)
+            let mut outer_msg = opad.clone();
+            outer_msg.extend_from_slice(&inner);
+            prev(&outer_msg)
+        });
     }
-    h
+
+    f(key)
 }
 
 fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
