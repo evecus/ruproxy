@@ -352,8 +352,13 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         let plain = if is_eof { &[][..] } else { &buf[..n] };
 
         // Step 1: get padding size FIRST (same Shake128 order as decode side)
+        // Xray: NextPaddingLen() is called before Encode/Decode on the same Shake instance
         let pad_len: usize = if use_padding {
-            shake.as_mut().map(|s| (s.next_u16() % 64) as usize).unwrap_or(0)
+            shake.as_mut().map(|s| {
+                let p = (s.next_u16() % 64) as usize;
+                tracing::trace!("[vmess] down pad_len={p} count={count}");
+                p
+            }).unwrap_or(0)
         } else {
             0
         };
@@ -381,6 +386,7 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
 
         // Step 3: write size field = encrypted_len + pad_len (masked or plain)
         let total_size = (ct.len() + pad_len) as u16;
+        tracing::trace!("[vmess] down chunk={} ct_len={} pad_len={} total_size={}", count-1, ct.len(), pad_len, total_size);
         if use_auth_len {
             let nonce = chunk_nonce(&iv, count);
             count = count.wrapping_add(1);
