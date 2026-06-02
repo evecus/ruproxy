@@ -205,6 +205,14 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
 }
 
 // ── Uplink: decrypt AES-GCM chunks → target ───────────────────────────────────
+//
+// Xray chunk format (with masking + padding):
+//   [2 bytes: mask ^ (encrypted_len + padding_len)]
+//   [encrypted_len bytes: AES-GCM ciphertext (includes 16-byte tag)]
+//   [padding_len bytes: ignored random bytes]
+//
+// ShakeSizeParser.next() is called ONCE for padding (NextPaddingLen),
+// then ONCE for size mask (Decode). Order matters!
 
 async fn relay_up<R, W>(
     r: &mut R, w: &mut W,
@@ -213,30 +221,34 @@ async fn relay_up<R, W>(
 ) -> Result<()>
 where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
 {
-    // If ChunkStream bit not set, raw relay (SEC_NONE without chunk)
     if sec == SEC_NONE && opt & OPT_CHUNK_STREAM == 0 {
         tokio::io::copy(r, w).await?;
         return Ok(());
     }
 
-    let use_masking = opt & OPT_CHUNK_MASKING != 0;
+    let use_masking  = opt & OPT_CHUNK_MASKING != 0;
+    let use_padding  = opt & OPT_GLOBAL_PADDING != 0;
     let use_auth_len = opt & OPT_AUTH_LEN != 0;
-    let use_padding = opt & OPT_GLOBAL_PADDING != 0;
+    let auth_len_key = use_auth_len.then(|| kdf16(&key, &[b"auth_len"]));
 
-    let mut shake_size = use_masking.then(|| Shake128Reader::new(&iv));
+    // Single Shake128 instance — same as Xray's ShakeSizeParser
+    let mut shake = use_masking.then(|| Shake128Reader::new(&iv));
     let mut count: u16 = 0;
 
-    // auth_len uses a separate AES-GCM cipher for the length field
-    let auth_len_key = use_auth_len.then(|| kdf16(&key, &[b"auth_len"]));
-    let auth_len_iv_seed = iv; // nonce derived per chunk
-
     loop {
-        // ── Read size field ───────────────────────────────────────────────
-        let data_len: usize = if use_auth_len {
-            // 18 bytes = 2 plaintext + 16 GCM tag
-            let mut buf = [0u8; 18];
+        // Step 1: read padding length (if GlobalPadding)
+        // In Xray: padding = sizeParser.NextPaddingLen() BEFORE Decode
+        let pad_len: usize = if use_padding {
+            shake.as_mut().map(|s| (s.next_u16() % 64) as usize).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Step 2: read & decode size field
+        let total_len: usize = if use_auth_len {
+            let mut buf = [0u8; 18]; // 2 data + 16 tag
             r.read_exact(&mut buf).await?;
-            let nonce = chunk_nonce(&auth_len_iv_seed, count);
+            let nonce = chunk_nonce(&iv, count);
             let lc = Aes128Gcm::new_from_slice(&auth_len_key.unwrap())?;
             let plain = lc.decrypt(Nonce::from_slice(&nonce), buf.as_ref())
                 .map_err(|_| anyhow!("auth_len decrypt"))?;
@@ -246,58 +258,70 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
             let mut buf = [0u8; 2];
             r.read_exact(&mut buf).await?;
             let raw = u16::from_be_bytes(buf);
-            if let Some(ref mut sk) = shake_size {
+            if let Some(ref mut sk) = shake {
                 (raw ^ sk.next_u16()) as usize
             } else {
                 raw as usize
             }
         };
 
-        if data_len == 0 { break; }
+        // total_len = encrypted_len + pad_len
+        // encrypted_len includes 16-byte GCM tag
+        // EOF: total_len == overhead (16) + pad_len  →  plaintext empty
+        let encrypted_len = total_len.saturating_sub(pad_len);
 
-        // ── Read & decrypt payload ────────────────────────────────────────
-        match sec {
+        if encrypted_len == 0 { break; }
+
+        // Step 3: read & decrypt
+        let plain = match sec {
             SEC_NONE => {
-                let mut buf = vec![0u8; data_len];
+                let mut buf = vec![0u8; encrypted_len];
                 r.read_exact(&mut buf).await?;
-                // SEC_NONE with ChunkStream: no encryption, just size-delimited
-                let write_len = if use_padding && data_len >= 2 { data_len - 2 } else { data_len };
-                w.write_all(&buf[..write_len]).await?;
+                buf
             }
             SEC_AES128_GCM | SEC_AUTO => {
-                if data_len < 16 { bail!("chunk too small: {data_len}"); }
-                let mut ct = vec![0u8; data_len];
+                if encrypted_len < 16 { bail!("chunk too small: {encrypted_len}"); }
+                let mut ct = vec![0u8; encrypted_len];
                 r.read_exact(&mut ct).await?;
                 let nonce = chunk_nonce(&iv, count);
                 let cipher = Aes128Gcm::new_from_slice(&key)?;
-                let plain = cipher.decrypt(Nonce::from_slice(&nonce), ct.as_slice())
-                    .map_err(|_| anyhow!("aes-gcm decrypt at {count}"))?;
-                count = count.wrapping_add(1);
-                let payload_len = plain.len().saturating_sub(if use_padding { padding_len(&mut shake_size) } else { 0 });
-                if plain.is_empty() { break; } // EOF chunk
-                w.write_all(&plain[..payload_len]).await?;
+                cipher.decrypt(Nonce::from_slice(&nonce), ct.as_slice())
+                    .map_err(|_| anyhow!("aes-gcm decrypt at {count}"))?
             }
             SEC_CHACHA20 => {
                 use chacha20poly1305::ChaCha20Poly1305;
-                if data_len < 16 { bail!("chunk too small"); }
-                let mut ct = vec![0u8; data_len];
+                if encrypted_len < 16 { bail!("chunk too small"); }
+                let mut ct = vec![0u8; encrypted_len];
                 r.read_exact(&mut ct).await?;
                 let nonce = chunk_nonce(&iv, count);
                 let ck = chacha_key(&key);
                 let cipher = ChaCha20Poly1305::new_from_slice(&ck)?;
-                let plain = cipher.decrypt(chacha20poly1305::Nonce::from_slice(&nonce), ct.as_slice())
-                    .map_err(|_| anyhow!("chacha decrypt"))?;
-                count = count.wrapping_add(1);
-                if plain.is_empty() { break; }
-                w.write_all(&plain).await?;
+                cipher.decrypt(chacha20poly1305::Nonce::from_slice(&nonce), ct.as_slice())
+                    .map_err(|_| anyhow!("chacha decrypt"))?
             }
             _ => bail!("unsupported security {sec}"),
+        };
+        count = count.wrapping_add(1);
+
+        // Step 4: skip padding bytes
+        if pad_len > 0 {
+            let mut skip = vec![0u8; pad_len];
+            r.read_exact(&mut skip).await?;
         }
+
+        if plain.is_empty() { break; }
+        w.write_all(&plain).await?;
     }
     Ok(())
 }
 
 // ── Downlink: target → AES-GCM chunks → client ───────────────────────────────
+//
+// Xray chunk format (write side):
+//   paddingSize = sizeParser.NextPaddingLen()
+//   sizeParser.Encode(encrypted_len + paddingSize, ...)  →  2 bytes
+//   [encrypted_len bytes: ciphertext]
+//   [paddingSize bytes: random]
 
 async fn relay_down<R, W>(
     r: &mut R, w: &mut W,
@@ -310,26 +334,33 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         tokio::io::copy(r, w).await?;
         return Ok(());
     }
-    tracing::debug!("[vmess] relay_down sec={sec:#x} opt={opt:#x} masking={} auth_len={}", opt & OPT_CHUNK_MASKING != 0, opt & OPT_AUTH_LEN != 0);
+    tracing::debug!("[vmess] relay_down sec={sec:#x} opt={opt:#x} masking={} padding={} auth_len={}",
+        opt & OPT_CHUNK_MASKING != 0, opt & OPT_GLOBAL_PADDING != 0, opt & OPT_AUTH_LEN != 0);
 
     let use_masking  = opt & OPT_CHUNK_MASKING != 0;
+    let use_padding  = opt & OPT_GLOBAL_PADDING != 0;
     let use_auth_len = opt & OPT_AUTH_LEN != 0;
-
-    let mut shake_size = use_masking.then(|| Shake128Reader::new(&iv));
-    let mut count: u16 = 0;
     let auth_len_key = use_auth_len.then(|| kdf16(&key, &[b"auth_len"]));
 
+    let mut shake = use_masking.then(|| Shake128Reader::new(&iv));
+    let mut count: u16 = 0;
     let mut buf = vec![0u8; CHUNK_SIZE];
 
     loop {
         let n = r.read(&mut buf).await?;
         let is_eof = n == 0;
-
-        // Encrypt payload (or empty slice for EOF chunk)
         let plain = if is_eof { &[][..] } else { &buf[..n] };
 
+        // Step 1: get padding size FIRST (same Shake128 order as decode side)
+        let pad_len: usize = if use_padding {
+            shake.as_mut().map(|s| (s.next_u16() % 64) as usize).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Step 2: encrypt
         let ct: Vec<u8> = match sec {
-            SEC_NONE => plain.to_vec(), // no encryption
+            SEC_NONE => plain.to_vec(),
             SEC_AES128_GCM | SEC_AUTO => {
                 let nonce = chunk_nonce(&iv, count);
                 let cipher = Aes128Gcm::new_from_slice(&key)?;
@@ -348,23 +379,31 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         };
         count = count.wrapping_add(1);
 
-        let data_len = ct.len() as u16;
-
-        // Write size field
+        // Step 3: write size field = encrypted_len + pad_len (masked or plain)
+        let total_size = (ct.len() + pad_len) as u16;
         if use_auth_len {
-            let nonce = chunk_nonce(&iv, count); // use next count for len
-            let lc = Aes128Gcm::new_from_slice(&auth_len_key.unwrap())?;
-            let enc_len = lc.encrypt(Nonce::from_slice(&nonce), data_len.to_be_bytes().as_ref())
-                .map_err(|_| anyhow!("len encrypt"))?;
+            let nonce = chunk_nonce(&iv, count);
             count = count.wrapping_add(1);
+            let lc = Aes128Gcm::new_from_slice(&auth_len_key.unwrap())?;
+            let enc_len = lc.encrypt(Nonce::from_slice(&nonce), total_size.to_be_bytes().as_ref())
+                .map_err(|_| anyhow!("len encrypt"))?;
             w.write_all(&enc_len).await?;
-        } else if let Some(ref mut sk) = shake_size {
-            w.write_all(&(data_len ^ sk.next_u16()).to_be_bytes()).await?;
+        } else if let Some(ref mut sk) = shake {
+            w.write_all(&(total_size ^ sk.next_u16()).to_be_bytes()).await?;
         } else {
-            w.write_all(&data_len.to_be_bytes()).await?;
+            w.write_all(&total_size.to_be_bytes()).await?;
         }
 
+        // Step 4: write ciphertext
         w.write_all(&ct).await?;
+
+        // Step 5: write random padding
+        if pad_len > 0 {
+            let mut pad = vec![0u8; pad_len];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut pad);
+            w.write_all(&pad).await?;
+        }
+
         w.flush().await?;
 
         if is_eof { break; }
@@ -380,10 +419,6 @@ fn chunk_nonce(iv: &[u8; 16], count: u16) -> [u8; 12] {
     n[0..2].copy_from_slice(&count.to_be_bytes());
     n[2..12].copy_from_slice(&iv[2..12]);
     n
-}
-
-fn padding_len(shake: &mut Option<Shake128Reader>) -> usize {
-    shake.as_mut().map(|s| (s.next_u16() % 64) as usize).unwrap_or(0)
 }
 
 /// ChaCha20 key = MD5(key) ++ MD5(MD5(key))
