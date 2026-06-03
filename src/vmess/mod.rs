@@ -716,7 +716,7 @@ impl<W: AsyncWrite + Unpin> Aes128CfbWriter<W> {
         use aes_gcm::aes::cipher::KeyInit;
         let cipher = aes_gcm::aes::Aes128::new_from_slice(key).unwrap();
         // Generate first keystream block
-        let mut register = *iv;
+        let register = *iv;
         let mut keystream = register;
         use aes_gcm::aes::cipher::BlockEncrypt;
         let block = aes_gcm::aes::Block::from_mut_slice(&mut keystream);
