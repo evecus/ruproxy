@@ -178,7 +178,7 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     encode_response_header(io, &req).await?;
 
     let (mut out_r, mut out_w) = outbound.into_split();
-    let (mut in_r, in_w)   = tokio::io::split(io);
+    let (mut in_r, mut in_w)   = tokio::io::split(io);
 
     let opt = req.option;
     let sec = req.security;
