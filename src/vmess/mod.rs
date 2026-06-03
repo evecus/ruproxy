@@ -111,8 +111,7 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
                         let mut io: Box<dyn RW> = Box::new(xhs);
-                        // xhttp response body 已是 GCM chunk，不需要额外 CFB 层
-                        if let Err(e) = process(&mut *io, peer, cmd_key, false).await {
+                        if let Err(e) = process(&mut *io, peer, cmd_key).await {
                             warn!("[vmess] {peer}: {e:#}");
                         }
                     });
@@ -161,15 +160,13 @@ async fn handle(
         }
         _ => bail!("unknown transport"),
     };
-    // tcp/ws 路径：response body 用 AES-128-CFB 流加密
-    process(&mut *io, peer, cmd_key, true).await
+    process(&mut *io, peer, cmd_key).await
 }
 
 // ── Core process ──────────────────────────────────────────────────────────────
 
 async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     io: &mut S, peer: SocketAddr, cmd_key: [u8; 16],
-    use_cfb: bool,
 ) -> Result<()> {
     let req = decode_request_header(io, &cmd_key).await.context("decode header")?;
     info!("[vmess] {peer} -> {} (sec={:#x} opt={:#x})", req.target, req.security, req.option);
@@ -183,61 +180,36 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     let opt = req.option;
     let sec = req.security;
 
-    if use_cfb {
-        // tcp/ws 传输：Xray 客户端在读完 AEAD response header 后，用 AES-128-CFB
-        // 解密剩余 response body，因此服务端必须用 CFB 加密下行流。
-        let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
+    // Xray 客户端在解完 AEAD response header 后，会用 AES-128-CFB 解密剩余 response body
+    // (DecodeResponseHeader 末尾: c.responseReader = NewCryptionReader(AesCfbStream, reader))
+    // 然后 DecodeResponseBody 在 CFB 解密流上再做 GCM chunk 解密。
+    // 因此服务端必须：GCM chunks → CFB 加密 → 发出
+    // 无论 tcp/ws 还是 xhttp 传输，这一层都是必须的。
+    let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
 
-        let up = {
-            let k = req.request_body_key;
-            let v = req.request_body_iv;
-            async move {
-                if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
-                    tracing::debug!("[vmess] up: {e}");
-                }
-                let _ = out_w.shutdown().await;
+    let up = {
+        let k = req.request_body_key;
+        let v = req.request_body_iv;
+        async move {
+            if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
+                tracing::debug!("[vmess] up: {e}");
             }
-        };
+            let _ = out_w.shutdown().await;
+        }
+    };
 
-        let dn = {
-            let k = req.response_body_key;
-            let v = req.response_body_iv;
-            async move {
-                if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
-                    tracing::debug!("[vmess] dn: {e}");
-                }
-                let _ = cfb_w.shutdown().await;
+    let dn = {
+        let k = req.response_body_key;
+        let v = req.response_body_iv;
+        async move {
+            if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
+                tracing::debug!("[vmess] dn: {e}");
             }
-        };
+            let _ = cfb_w.shutdown().await;
+        }
+    };
 
-        tokio::join!(up, dn);
-    } else {
-        // xhttp 传输：response body 已经是 GCM chunk（relay_down 内部加密），
-        // 不需要额外的 CFB 层，直接写入底层 IO。
-        let up = {
-            let k = req.request_body_key;
-            let v = req.request_body_iv;
-            async move {
-                if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
-                    tracing::debug!("[vmess] up: {e}");
-                }
-                let _ = out_w.shutdown().await;
-            }
-        };
-
-        let dn = {
-            let k = req.response_body_key;
-            let v = req.response_body_iv;
-            async move {
-                if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, opt, sec).await {
-                    tracing::debug!("[vmess] dn: {e}");
-                }
-                // in_w 由 tokio::io::split 产生，已在 tokio::join! 外自动 drop
-            }
-        };
-
-        tokio::join!(up, dn);
-    }
+    tokio::join!(up, dn);
     Ok(())
 }
 
@@ -729,62 +701,86 @@ fn vmess_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
 //   iv_0 = IV
 //   keystream_i = AES(key, iv_{i-1})
 //   ciphertext_i = plaintext_i XOR keystream_i[..len(plaintext_i)]
-//   iv_i = ciphertext_i  (if full block consumed)
+//   iv_{i+1} uses ciphertext as new register (byte-by-byte, CFB8-style within the block)
 //
-// This is CFB with 128-bit segment size (CFB128), matching Go's cipher.NewCFBEncrypter.
+// Matches Go's cipher.NewCFBEncrypter behavior (CFB with 128-bit feedback).
+//
+// CORRECTNESS REQUIREMENT: encrypted bytes must be buffered and flushed atomically.
+// If poll_write returns Pending after encryption, the CFB state has already advanced —
+// we must retry with the *same* ciphertext, not re-encrypt the plaintext.
+// Therefore we keep a `pending` buffer of already-encrypted bytes waiting to be sent.
 
 struct Aes128CfbWriter<W> {
     inner:    W,
     cipher:   aes_gcm::aes::Aes128,
-    register: [u8; 16],  // current feedback register
-    keystream: [u8; 16], // buffered keystream block
-    ks_pos:    usize,    // position in keystream
+    register: [u8; 16],   // current feedback register
+    keystream: [u8; 16],  // buffered keystream block
+    ks_pos:    usize,     // position in keystream
+    pending:   Vec<u8>,   // encrypted bytes not yet written to inner
 }
 
 impl<W: AsyncWrite + Unpin> Aes128CfbWriter<W> {
     fn new(inner: W, key: &[u8; 16], iv: &[u8; 16]) -> Self {
-        use aes_gcm::aes::cipher::KeyInit;
+        use aes_gcm::aes::cipher::{BlockEncrypt, KeyInit};
         let cipher = aes_gcm::aes::Aes128::new_from_slice(key).unwrap();
-        // Generate first keystream block
         let register = *iv;
         let mut keystream = register;
-        use aes_gcm::aes::cipher::BlockEncrypt;
         let block = aes_gcm::aes::Block::from_mut_slice(&mut keystream);
         cipher.encrypt_block(block);
-        Self { inner, cipher, register, keystream, ks_pos: 0 }
+        Self { inner, cipher, register, keystream, ks_pos: 0, pending: Vec::new() }
     }
 
-    fn encrypt_bytes(&mut self, data: &mut [u8]) {
+    fn encrypt_bytes(&mut self, data: &[u8]) -> Vec<u8> {
         use aes_gcm::aes::cipher::BlockEncrypt;
-        for byte in data.iter_mut() {
+        let mut out = Vec::with_capacity(data.len());
+        for &byte in data {
             if self.ks_pos == 16 {
-                // Regenerate keystream: AES(register)
-                // After CFB128: new register = previous ciphertext block
-                // (handled below — register updated as we encrypt)
                 let mut ks = self.register;
                 let block = aes_gcm::aes::Block::from_mut_slice(&mut ks);
                 self.cipher.encrypt_block(block);
                 self.keystream = ks;
                 self.ks_pos = 0;
             }
-            let ct = *byte ^ self.keystream[self.ks_pos];
-            // Update register with ciphertext byte
+            let ct = byte ^ self.keystream[self.ks_pos];
             self.register[self.ks_pos] = ct;
-            *byte = ct;
             self.ks_pos += 1;
+            out.push(ct);
         }
+        out
     }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for Aes128CfbWriter<W> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let mut encrypted = buf.to_vec();
-        this.encrypt_bytes(&mut encrypted);
-        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
-            other => other,
+
+        // If there are already-encrypted bytes waiting, flush them first before
+        // accepting new plaintext. This prevents CFB state corruption on retry.
+        if this.pending.is_empty() {
+            // Encrypt now; advance CFB state.
+            this.pending = this.encrypt_bytes(buf);
         }
+
+        // Try to drain pending. poll_write_all is not available on AsyncWrite,
+        // so we loop until everything is sent or we get Pending/Err.
+        while !this.pending.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.pending) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "cfb inner writer returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.pending.drain(..n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        // All encrypted bytes written; report original plaintext length consumed.
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
