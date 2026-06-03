@@ -24,6 +24,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes128Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use sha2::{Digest, Sha256};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -173,7 +175,12 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     encode_response_header(io, &req).await?;
 
     let (mut out_r, mut out_w) = outbound.into_split();
-    let (mut in_r, mut in_w)   = tokio::io::split(io);
+    let (mut in_r, in_w)   = tokio::io::split(io);
+
+    // Response body must be wrapped with AES-128-CFB stream cipher
+    // Xray DecodeResponseHeader wraps remaining reader with AES-CFB decrypt,
+    // so server must encrypt response body with AES-CFB.
+    let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
 
     let opt = req.option;
     let sec = req.security;
@@ -193,10 +200,10 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
         let k = req.response_body_key;
         let v = req.response_body_iv;
         async move {
-            if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, opt, sec).await {
+            if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
                 tracing::debug!("[vmess] dn: {e}");
             }
-            let _ = in_w.shutdown().await;
+            let _ = cfb_w.shutdown().await;
         }
     };
 
@@ -680,4 +687,81 @@ fn vmess_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     let mut v = uuid.to_vec();
     v.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
     Md5::digest(&v)[..16].try_into().unwrap()
+}
+
+// ── AES-128-CFB stream writer ─────────────────────────────────────────────────
+//
+// Xray DecodeResponseHeader wraps the remaining reader with AES-128-CFB
+// decryption after reading the AEAD response header. Therefore the server must
+// encrypt all response body bytes with AES-128-CFB.
+//
+// CFB-128 mode: feedback register is full block (16 bytes).
+//   iv_0 = IV
+//   keystream_i = AES(key, iv_{i-1})
+//   ciphertext_i = plaintext_i XOR keystream_i[..len(plaintext_i)]
+//   iv_i = ciphertext_i  (if full block consumed)
+//
+// This is CFB with 128-bit segment size (CFB128), matching Go's cipher.NewCFBEncrypter.
+
+struct Aes128CfbWriter<W> {
+    inner:    W,
+    cipher:   aes_gcm::aes::Aes128,
+    register: [u8; 16],  // current feedback register
+    keystream: [u8; 16], // buffered keystream block
+    ks_pos:    usize,    // position in keystream
+}
+
+impl<W: AsyncWrite + Unpin> Aes128CfbWriter<W> {
+    fn new(inner: W, key: &[u8; 16], iv: &[u8; 16]) -> Self {
+        use aes_gcm::aes::cipher::KeyInit;
+        let cipher = aes_gcm::aes::Aes128::new_from_slice(key).unwrap();
+        // Generate first keystream block
+        let mut register = *iv;
+        let mut keystream = register;
+        use aes_gcm::aes::cipher::BlockEncrypt;
+        let block = aes_gcm::aes::Block::from_mut_slice(&mut keystream);
+        cipher.encrypt_block(block);
+        Self { inner, cipher, register, keystream, ks_pos: 0 }
+    }
+
+    fn encrypt_bytes(&mut self, data: &mut [u8]) {
+        use aes_gcm::aes::cipher::BlockEncrypt;
+        for byte in data.iter_mut() {
+            if self.ks_pos == 16 {
+                // Regenerate keystream: AES(register)
+                // After CFB128: new register = previous ciphertext block
+                // (handled below — register updated as we encrypt)
+                let mut ks = self.register;
+                let block = aes_gcm::aes::Block::from_mut_slice(&mut ks);
+                self.cipher.encrypt_block(block);
+                self.keystream = ks;
+                self.ks_pos = 0;
+            }
+            let ct = *byte ^ self.keystream[self.ks_pos];
+            // Update register with ciphertext byte
+            self.register[self.ks_pos] = ct;
+            *byte = ct;
+            self.ks_pos += 1;
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Aes128CfbWriter<W> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let mut encrypted = buf.to_vec();
+        this.encrypt_bytes(&mut encrypted);
+        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
+            Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
+            other => other,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
