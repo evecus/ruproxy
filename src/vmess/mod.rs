@@ -111,7 +111,8 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
                     tokio::spawn(async move {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
                         let mut io: Box<dyn RW> = Box::new(xhs);
-                        if let Err(e) = process(&mut *io, peer, cmd_key).await {
+                        // xhttp response body 已是 GCM chunk，不需要额外 CFB 层
+                        if let Err(e) = process(&mut *io, peer, cmd_key, false).await {
                             warn!("[vmess] {peer}: {e:#}");
                         }
                     });
@@ -160,13 +161,15 @@ async fn handle(
         }
         _ => bail!("unknown transport"),
     };
-    process(&mut *io, peer, cmd_key).await
+    // tcp/ws 路径：response body 用 AES-128-CFB 流加密
+    process(&mut *io, peer, cmd_key, true).await
 }
 
 // ── Core process ──────────────────────────────────────────────────────────────
 
 async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     io: &mut S, peer: SocketAddr, cmd_key: [u8; 16],
+    use_cfb: bool,
 ) -> Result<()> {
     let req = decode_request_header(io, &cmd_key).await.context("decode header")?;
     info!("[vmess] {peer} -> {} (sec={:#x} opt={:#x})", req.target, req.security, req.option);
@@ -177,37 +180,64 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     let (mut out_r, mut out_w) = outbound.into_split();
     let (mut in_r, in_w)   = tokio::io::split(io);
 
-    // Response body must be wrapped with AES-128-CFB stream cipher
-    // Xray DecodeResponseHeader wraps remaining reader with AES-CFB decrypt,
-    // so server must encrypt response body with AES-CFB.
-    let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
-
     let opt = req.option;
     let sec = req.security;
 
-    let up = {
-        let k = req.request_body_key;
-        let v = req.request_body_iv;
-        async move {
-            if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
-                tracing::debug!("[vmess] up: {e}");
-            }
-            let _ = out_w.shutdown().await;
-        }
-    };
+    if use_cfb {
+        // tcp/ws 传输：Xray 客户端在读完 AEAD response header 后，用 AES-128-CFB
+        // 解密剩余 response body，因此服务端必须用 CFB 加密下行流。
+        let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
 
-    let dn = {
-        let k = req.response_body_key;
-        let v = req.response_body_iv;
-        async move {
-            if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
-                tracing::debug!("[vmess] dn: {e}");
+        let up = {
+            let k = req.request_body_key;
+            let v = req.request_body_iv;
+            async move {
+                if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
+                    tracing::debug!("[vmess] up: {e}");
+                }
+                let _ = out_w.shutdown().await;
             }
-            let _ = cfb_w.shutdown().await;
-        }
-    };
+        };
 
-    tokio::join!(up, dn);
+        let dn = {
+            let k = req.response_body_key;
+            let v = req.response_body_iv;
+            async move {
+                if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
+                    tracing::debug!("[vmess] dn: {e}");
+                }
+                let _ = cfb_w.shutdown().await;
+            }
+        };
+
+        tokio::join!(up, dn);
+    } else {
+        // xhttp 传输：response body 已经是 GCM chunk（relay_down 内部加密），
+        // 不需要额外的 CFB 层，直接写入底层 IO。
+        let up = {
+            let k = req.request_body_key;
+            let v = req.request_body_iv;
+            async move {
+                if let Err(e) = relay_up(&mut in_r, &mut out_w, k, v, opt, sec).await {
+                    tracing::debug!("[vmess] up: {e}");
+                }
+                let _ = out_w.shutdown().await;
+            }
+        };
+
+        let dn = {
+            let k = req.response_body_key;
+            let v = req.response_body_iv;
+            async move {
+                if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, opt, sec).await {
+                    tracing::debug!("[vmess] dn: {e}");
+                }
+                // in_w 由 tokio::io::split 产生，已在 tokio::join! 外自动 drop
+            }
+        };
+
+        tokio::join!(up, dn);
+    }
     Ok(())
 }
 
