@@ -62,122 +62,134 @@ async fn main() -> Result<()> {
 
     if cfg.is_empty() {
         anyhow::bail!(
-            "no protocols configured — add at least one [hysteria2], [[vless]], [[vmess]], \
-             [[trojan]], [[shadowsocks]], [[wireguard]], [[tuic]], [[anytls]], or [[socks]] section"
+            "no nodes configured — add at least one [[node]] section with type = \"vless\" / \
+             \"vmess\" / \"trojan\" / \"shadowsocks\" / \"hysteria2\" / \"tuic\" / \
+             \"wireguard\" / \"anytls\" / \"socks\""
         );
+    }
+
+    // ── tag 唯一性校验 ────────────────────────────────────────────────────────
+    if let Some(dup) = cfg.check_duplicate_tags() {
+        anyhow::bail!("duplicate node tag: \"{dup}\" — each [[node]] must have a unique tag");
     }
 
     let mut handles = Vec::new();
 
-    // ── Hysteria2 ─────────────────────────────────────────────────────────────
-    for hy2_cfg in cfg.hysteria2 {
-        let hy2_cfg = Arc::new(hy2_cfg);
-        info!("[hy2] enabled, listen: {}", hy2_cfg.listen);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = hysteria2::server::run(hy2_cfg).await {
-                tracing::error!("[hy2] server exited: {e:#}");
-            }
-        }));
-    }
+    for node in cfg.node {
+        let tag = node.tag.clone();
+        match node.inner {
 
-    // ── VLESS ─────────────────────────────────────────────────────────────────
-    for vless_cfg in cfg.vless {
-        let vless_cfg = Arc::new(vless_cfg);
-        let tls_label = match &vless_cfg.tls {
-            None => "none",
-            Some(crate::config::VlessTlsConfig::Tls { .. }) => "tls",
-            Some(crate::config::VlessTlsConfig::Reality(_)) => "reality",
-        };
-        info!(
-            "[vless] enabled, listen: {}, transport={}, tls={tls_label}",
-            vless_cfg.listen, vless_cfg.transport.r#type,
-        );
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = vless::listener::run(vless_cfg).await {
-                tracing::error!("[vless] server exited: {e:#}");
+            // ── Hysteria2 ─────────────────────────────────────────────────────
+            config::NodeInner::Hysteria2(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] hysteria2, listen: {}", c.listen);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = hysteria2::server::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── Trojan ────────────────────────────────────────────────────────────────
-    for trojan_cfg in cfg.trojan {
-        let trojan_cfg = Arc::new(trojan_cfg);
-        info!("[trojan] enabled, listen: {}", trojan_cfg.listen);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = trojan::run(trojan_cfg).await {
-                tracing::error!("[trojan] server exited: {e:#}");
+            // ── VLESS ─────────────────────────────────────────────────────────
+            config::NodeInner::Vless(c) => {
+                let tls_label = match &c.tls {
+                    None => "none",
+                    Some(config::VlessTlsConfig::Tls { .. }) => "tls",
+                    Some(config::VlessTlsConfig::Reality(_)) => "reality",
+                };
+                let c = Arc::new(c);
+                info!(
+                    "[{tag}] vless, listen: {}, transport={}, tls={tls_label}",
+                    c.listen, c.transport.r#type,
+                );
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = vless::listener::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── VMess ─────────────────────────────────────────────────────────────────
-    for vmess_cfg in cfg.vmess {
-        let vmess_cfg = Arc::new(vmess_cfg);
-        info!("[vmess] enabled, listen: {}", vmess_cfg.listen);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = vmess::run(vmess_cfg).await {
-                tracing::error!("[vmess] server exited: {e:#}");
+            // ── VMess ─────────────────────────────────────────────────────────
+            config::NodeInner::Vmess(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] vmess, listen: {}, transport={}", c.listen, c.transport.r#type);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = vmess::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── Shadowsocks ───────────────────────────────────────────────────────────
-    for ss_cfg in cfg.shadowsocks {
-        let ss_cfg = Arc::new(ss_cfg);
-        info!(
-            "[shadowsocks] enabled, listen: {}, method={:?}, transport={}",
-            ss_cfg.listen, ss_cfg.method, ss_cfg.transport.r#type,
-        );
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = shadowsocks::server::run(ss_cfg).await {
-                tracing::error!("[shadowsocks] server exited: {e:#}");
+            // ── Trojan ────────────────────────────────────────────────────────
+            config::NodeInner::Trojan(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] trojan, listen: {}, transport={}", c.listen, c.transport.r#type);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = trojan::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── TUIC ──────────────────────────────────────────────────────────────────
-    for tuic_cfg in cfg.tuic {
-        let tuic_cfg = Arc::new(tuic_cfg);
-        info!("[tuic] enabled, listen: {}, users: {}", tuic_cfg.listen, tuic_cfg.users.len());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = tuic::run(tuic_cfg).await {
-                tracing::error!("[tuic] server exited: {e:#}");
+            // ── Shadowsocks ───────────────────────────────────────────────────
+            config::NodeInner::Shadowsocks(c) => {
+                let c = Arc::new(c);
+                info!(
+                    "[{tag}] shadowsocks, listen: {}, method={:?}, transport={}",
+                    c.listen, c.method, c.transport.r#type,
+                );
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = shadowsocks::server::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── WireGuard ─────────────────────────────────────────────────────────────
-    for wg_cfg in cfg.wireguard {
-        let wg_cfg = Arc::new(wg_cfg);
-        info!("[wireguard] enabled, listen: {}, peers: {}", wg_cfg.listen, wg_cfg.peers.len());
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = wireguard::server::run(wg_cfg).await {
-                tracing::error!("[wireguard] server exited: {e:#}");
+            // ── TUIC ──────────────────────────────────────────────────────────
+            config::NodeInner::Tuic(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] tuic, listen: {}, users: {}", c.listen, c.users.len());
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = tuic::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── AnyTLS ────────────────────────────────────────────────────────────────
-    for anytls_cfg in cfg.anytls {
-        let anytls_cfg = Arc::new(anytls_cfg);
-        info!("[anytls] enabled, listen: {}", anytls_cfg.listen);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = anytls::server::run(anytls_cfg).await {
-                tracing::error!("[anytls] server exited: {e:#}");
+            // ── WireGuard ─────────────────────────────────────────────────────
+            config::NodeInner::Wireguard(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] wireguard, listen: {}, peers: {}", c.listen, c.peers.len());
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = wireguard::server::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
-    }
 
-    // ── SOCKS5 ────────────────────────────────────────────────────────────────
-    for socks_cfg in cfg.socks {
-        let socks_cfg = Arc::new(socks_cfg);
-        let auth_label = if socks_cfg.users.is_empty() { "no-auth" } else { "password" };
-        info!("[socks5] enabled, listen: {}, auth={auth_label}", socks_cfg.listen);
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = socks::run(socks_cfg).await {
-                tracing::error!("[socks5] server exited: {e:#}");
+            // ── AnyTLS ────────────────────────────────────────────────────────
+            config::NodeInner::Anytls(c) => {
+                let c = Arc::new(c);
+                info!("[{tag}] anytls, listen: {}", c.listen);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = anytls::server::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
             }
-        }));
+
+            // ── SOCKS5 ────────────────────────────────────────────────────────
+            config::NodeInner::Socks(c) => {
+                let auth_label = if c.users.is_empty() { "no-auth" } else { "password" };
+                let c = Arc::new(c);
+                info!("[{tag}] socks5, listen: {}, auth={auth_label}", c.listen);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = socks::run(c).await {
+                        tracing::error!("[{tag}] server exited: {e:#}");
+                    }
+                }));
+            }
+        }
     }
 
     tokio::signal::ctrl_c()
