@@ -420,8 +420,10 @@ async fn handle_post(
 fn downlink_response(down_rx: mpsc::Receiver<bytes::Bytes>) -> Response<ResponseBody> {
     Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", "application/octet-stream")
-        .header("Cache-Control", "no-cache, no-store")
+        // text/event-stream makes nginx and CDN middleboxes disable buffering,
+        // matching Xray's hub.go behavior (NoSSEHeader=false by default)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-store")
         .header("Access-Control-Allow-Origin", "*")
         .header("X-Accel-Buffering", "no")
         .body(ResponseBody::Stream(down_rx))
