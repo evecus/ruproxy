@@ -112,7 +112,7 @@ pub async fn run(cfg: Arc<VmessConfig>) -> Result<()> {
                         let peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
                         let mut io: Box<dyn RW> = Box::new(xhs);
                         if let Err(e) = process(&mut *io, peer, cmd_key).await {
-                            warn!("[vmess] {peer}: {e:#}");
+                            warn!("[vmess] {peer}: {e:#}  (chain: {:?})", e.chain().collect::<Vec<_>>());
                         }
                     });
                 }
@@ -180,12 +180,11 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
     let opt = req.option;
     let sec = req.security;
 
-    // Xray 客户端在解完 AEAD response header 后，会用 AES-128-CFB 解密剩余 response body
-    // (DecodeResponseHeader 末尾: c.responseReader = NewCryptionReader(AesCfbStream, reader))
-    // 然后 DecodeResponseBody 在 CFB 解密流上再做 GCM chunk 解密。
-    // 因此服务端必须：GCM chunks → CFB 加密 → 发出
-    // 无论 tcp/ws 还是 xhttp 传输，这一层都是必须的。
-    let mut cfb_w = Aes128CfbWriter::new(in_w, &req.response_body_key, &req.response_body_iv);
+    // Xray DecodeResponseBody (outbound.go:204) is called with the raw `reader`,
+    // NOT with session.responseReader (which wraps it in CFB). The CFB-wrapped
+    // reader set in DecodeResponseHeader is never actually used for body decoding.
+    // Therefore the server must send plain GCM chunks with NO CFB outer layer.
+    let mut in_w = in_w;
 
     let up = {
         let k = req.request_body_key;
@@ -202,10 +201,10 @@ async fn process<S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized>(
         let k = req.response_body_key;
         let v = req.response_body_iv;
         async move {
-            if let Err(e) = relay_down(&mut out_r, &mut cfb_w, k, v, opt, sec).await {
+            if let Err(e) = relay_down(&mut out_r, &mut in_w, k, v, opt, sec).await {
                 tracing::debug!("[vmess] dn: {e}");
             }
-            let _ = cfb_w.shutdown().await;
+            let _ = in_w.shutdown().await;
         }
     };
 
@@ -360,12 +359,14 @@ where R: AsyncRead + Unpin, W: AsyncWrite + Unpin,
         let is_eof = n == 0;
         let plain = if is_eof { &[][..] } else { &buf[..n] };
 
+        tracing::debug!("[vmess] relay_down chunk count={count} n={n} is_eof={is_eof}");
+
         // Step 1: get padding size FIRST (same Shake128 order as decode side)
         // Xray: NextPaddingLen() is called before Encode/Decode on the same Shake instance
         let pad_len: usize = if use_padding {
             shake.as_mut().map(|s| {
                 let p = (s.next_u16() % 64) as usize;
-                tracing::trace!("[vmess] down pad_len={p} count={count}");
+                tracing::debug!("[vmess] down pad_len={p} count={count}");
                 p
             }).unwrap_or(0)
         } else {
