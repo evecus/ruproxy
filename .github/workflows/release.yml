@@ -67,6 +67,11 @@ jobs:
         if: matrix.cross && steps.cache-cross.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Inject version into Cargo.toml
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          sed -i "s/^version = .*/version = \"${VERSION#v}\"/" Cargo.toml
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
