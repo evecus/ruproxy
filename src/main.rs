@@ -1,6 +1,7 @@
 mod anytls;
 mod common;
 mod config;
+mod generate;
 mod hysteria2;
 mod shadowsocks;
 mod socks;
@@ -23,6 +24,22 @@ async fn main() -> Result<()> {
         .expect("failed to install rustls crypto provider");
 
     // ── Parse CLI ─────────────────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+
+    // generate 子命令：不需要加载 config，直接执行后退出
+    if args.get(1).map(|s| s.as_str()) == Some("generate") {
+        match args.get(2).map(|s| s.as_str()) {
+            Some("wireguard-keypair") => return generate::wireguard_keypair(),
+            Some("reality-keypair")   => return generate::reality_keypair(),
+            _ => {
+                eprintln!("用法:");
+                eprintln!("  ruproxy generate wireguard-keypair   生成 WireGuard 服务端+客户端密钥对");
+                eprintln!("  ruproxy generate reality-keypair     生成 Reality x25519 密钥对");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let config_path = parse_config_arg();
 
     // ── Load config ───────────────────────────────────────────────────────────
