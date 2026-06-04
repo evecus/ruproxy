@@ -1,6 +1,6 @@
 [package]
 name = "ruproxy"
-version = "0.2.0"
+version = "0.1.2"
 edition = "2021"
 description = "A multi-protocol proxy server (Hysteria2 + VLESS + Reality + Shadowsocks 2022 + AnyTLS) in Rust"
 license = "MIT"
