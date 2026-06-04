@@ -65,7 +65,10 @@ pub async fn run(cfg: Arc<VlessConfig>) -> Result<()> {
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(p) => p,
-                    Err(e) => { warn!("[vless] accept error: {e}"); continue; }
+                    Err(e) => {
+                        warn!("[vless] accept error: {e}");
+                        continue;
+                    }
                 };
                 debug!("[vless] New connection from {peer}");
                 match &cfg2.tls {
@@ -77,7 +80,10 @@ pub async fn run(cfg: Arc<VlessConfig>) -> Result<()> {
                         debug!("[vless] {peer} → XHTTP+TLS");
                         let acceptor = match &tls_acceptor2 {
                             Some(a) => Arc::clone(a),
-                            None => { warn!("[vless] TLS acceptor missing"); continue; }
+                            None => {
+                                warn!("[vless] TLS acceptor missing");
+                                continue;
+                            }
                         };
                         let srv = xhttp_server_feed.clone();
                         tokio::spawn(async move {

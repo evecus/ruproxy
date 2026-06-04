@@ -46,10 +46,15 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(p) => p,
-                    Err(e) => { warn!("[trojan] accept error: {e}"); continue; }
+                    Err(e) => {
+                        warn!("[trojan] accept error: {e}");
+                        continue;
+                    }
                 };
                 match &tls2 {
-                    None => { srv_feed.feed_plain(stream, peer); }
+                    None => {
+                        srv_feed.feed_plain(stream, peer);
+                    }
                     Some(acc) => {
                         let acc = Arc::clone(acc);
                         let srv = srv_feed.clone();
@@ -66,7 +71,10 @@ pub async fn run(cfg: Arc<TrojanConfig>) -> Result<()> {
 
         loop {
             match xhttp_server.accept().await {
-                None => { warn!("[trojan] xhttp server closed"); break; }
+                None => {
+                    warn!("[trojan] xhttp server closed");
+                    break;
+                }
                 Some(xhs) => {
                     let pw = password.clone();
                     tokio::spawn(async move {
@@ -137,14 +145,22 @@ async fn decode_trojan<S: AsyncRead + Unpin + ?Sized>(s: &mut S, password: &str)
     loop {
         let b = s.read_u8().await?;
         line.push(b);
-        if line.ends_with(b"\r\n") { break; }
-        if line.len() > 256 { bail!("bad auth") }
+        if line.ends_with(b"\r\n") {
+            break;
+        }
+        if line.len() > 256 {
+            bail!("bad auth")
+        }
     }
     let got = String::from_utf8_lossy(&line[..line.len() - 2]);
     let expected = hex::encode(Sha224::digest(password.as_bytes()));
-    if got != expected { bail!("invalid password"); }
+    if got != expected {
+        bail!("invalid password");
+    }
     let cmd = s.read_u8().await?;
-    if cmd != 1 { bail!("only tcp supported"); }
+    if cmd != 1 {
+        bail!("only tcp supported");
+    }
     let atyp = s.read_u8().await?;
     let host = match atyp {
         1 => {
@@ -171,7 +187,10 @@ async fn decode_trojan<S: AsyncRead + Unpin + ?Sized>(s: &mut S, password: &str)
     Ok(format!("{host}:{port}"))
 }
 
-async fn relay<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(inbound: &mut S, outbound: TcpStream) -> Result<()> {
+async fn relay<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+    inbound: &mut S,
+    outbound: TcpStream,
+) -> Result<()> {
     let (mut or, mut ow) = outbound.into_split();
     let (mut ir, mut iw) = tokio::io::split(inbound);
     let a = async {

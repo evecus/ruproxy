@@ -57,11 +57,16 @@ pub async fn run(cfg: Arc<ShadowsocksConfig>) -> Result<()> {
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(p) => p,
-                    Err(e) => { warn!("[shadowsocks] accept error: {e}"); continue; }
+                    Err(e) => {
+                        warn!("[shadowsocks] accept error: {e}");
+                        continue;
+                    }
                 };
                 debug!("[shadowsocks] new connection from {peer}");
                 match &tls2 {
-                    None => { srv_feed.feed_plain(stream, peer); }
+                    None => {
+                        srv_feed.feed_plain(stream, peer);
+                    }
                     Some(acc) => {
                         let acc = Arc::clone(acc);
                         let srv = srv_feed.clone();
@@ -78,7 +83,10 @@ pub async fn run(cfg: Arc<ShadowsocksConfig>) -> Result<()> {
 
         loop {
             match xhttp_server.accept().await {
-                None => { warn!("[shadowsocks] xhttp server closed"); break; }
+                None => {
+                    warn!("[shadowsocks] xhttp server closed");
+                    break;
+                }
                 Some(xhs) => {
                     let key = Arc::clone(&key2);
                     let cfg3 = Arc::clone(&cfg2);
@@ -193,7 +201,12 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n]).await.is_err() { break; }
+            if tokio::io::AsyncWriteExt::write_all(&mut out_w, &tmp[..n])
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut out_w).await;
         debug!("[shadowsocks] uplink closed {peer}→{t}");
@@ -207,8 +220,12 @@ where
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            if aead_w.write_data(&tmp[..n]).await.is_err() { break; }
-            if aead_w.flush().await.is_err() { break; }
+            if aead_w.write_data(&tmp[..n]).await.is_err() {
+                break;
+            }
+            if aead_w.flush().await.is_err() {
+                break;
+            }
         }
         debug!("[shadowsocks] downlink closed {t2}→{peer}");
     };

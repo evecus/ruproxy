@@ -59,14 +59,21 @@ pub struct XhttpConfig {
 
 impl Default for XhttpConfig {
     fn default() -> Self {
-        Self { path: "/".to_string(), host: None }
+        Self {
+            path: "/".to_string(),
+            host: None,
+        }
     }
 }
 
 impl XhttpConfig {
     pub fn normalized_path(&self) -> String {
         let p = self.path.trim_end_matches('/');
-        let p = if p.starts_with('/') { p.to_string() } else { format!("/{p}") };
+        let p = if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("/{p}")
+        };
         format!("{p}/")
     }
 }
@@ -102,7 +109,7 @@ pub struct XhttpServer {
 }
 
 struct ServerInner {
-    cfg:      XhttpConfig,
+    cfg: XhttpConfig,
     sessions: Mutex<HashMap<String, Arc<Mutex<Session>>>>,
     ready_tx: mpsc::Sender<XhttpStream>,
     ready_rx: Mutex<mpsc::Receiver<XhttpStream>>,
@@ -159,9 +166,10 @@ where
             Ok::<_, std::convert::Infallible>(resp)
         }
     });
-    if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-        .serve_connection(io, svc)
-        .await
+    if let Err(e) =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(io, svc)
+            .await
     {
         debug!("[xhttp] {peer} conn closed: {e}");
     }
@@ -169,10 +177,7 @@ where
 
 // ── Session 管理 ───────────────────────────────────────────────────────────────
 
-async fn get_or_create_session(
-    inner: &Arc<ServerInner>,
-    session_id: &str,
-) -> Arc<Mutex<Session>> {
+async fn get_or_create_session(inner: &Arc<ServerInner>, session_id: &str) -> Arc<Mutex<Session>> {
     let mut map = inner.sessions.lock().await;
     if let Some(s) = map.get(session_id) {
         return Arc::clone(s);
@@ -195,10 +200,9 @@ async fn get_or_create_session(
     let inner2 = Arc::clone(inner);
     let sid = session_id.to_string();
     tokio::spawn(async move {
-        let get_timed_out = tokio::time::timeout(
-            Duration::from_secs(30),
-            get_arrived.notified(),
-        ).await.is_err();
+        let get_timed_out = tokio::time::timeout(Duration::from_secs(30), get_arrived.notified())
+            .await
+            .is_err();
 
         if get_timed_out {
             // GET 30s 内未到，直接清理
@@ -250,7 +254,8 @@ async fn handle_request(
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
     if let Some(expected) = &inner.cfg.host {
-        let req_host = req.headers()
+        let req_host = req
+            .headers()
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -275,8 +280,10 @@ async fn handle_request(
         }
     };
 
-    debug!("[xhttp] {peer} {} session={session_id:?} seq={seq_str:?}",
-           req.method());
+    debug!(
+        "[xhttp] {peer} {} session={session_id:?} seq={seq_str:?}",
+        req.method()
+    );
 
     let is_downlink = *req.method() == Method::GET && seq_str.is_none();
     if is_downlink {
@@ -305,10 +312,15 @@ async fn handle_get(
                     None => break,
                     Some(Ok(frame)) => {
                         if let Ok(data) = frame.into_data() {
-                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
+                            if up_tx.send(UploadPacket::Chunk(data)).await.is_err() {
+                                break;
+                            }
                         }
                     }
-                    Some(Err(e)) => { debug!("[xhttp] {peer} stream-one up: {e}"); break; }
+                    Some(Err(e)) => {
+                        debug!("[xhttp] {peer} stream-one up: {e}");
+                        break;
+                    }
                 }
             }
             let _ = up_tx.send(UploadPacket::Eof).await;
@@ -382,10 +394,15 @@ async fn handle_post(
                         None => break,
                         Some(Ok(frame)) => {
                             if let Ok(data) = frame.into_data() {
-                                if up_tx.send(UploadPacket::Chunk(data)).await.is_err() { break; }
+                                if up_tx.send(UploadPacket::Chunk(data)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
-                        Some(Err(e)) => { debug!("[xhttp] {peer} stream-up: {e}"); break; }
+                        Some(Err(e)) => {
+                            debug!("[xhttp] {peer} stream-up: {e}");
+                            break;
+                        }
                     }
                 }
             });
@@ -404,10 +421,12 @@ async fn handle_post(
             let body = req.into_body();
             match body.collect().await {
                 Ok(c) => {
-                    let _ = up_tx.send(UploadPacket::Packet {
-                        seq,
-                        data: c.to_bytes(),
-                    }).await;
+                    let _ = up_tx
+                        .send(UploadPacket::Packet {
+                            seq,
+                            data: c.to_bytes(),
+                        })
+                        .await;
                 }
                 Err(e) => debug!("[xhttp] {peer} packet-up collect: {e}"),
             }
@@ -477,27 +496,34 @@ impl http_body::Body for ResponseBody {
 // ── XhttpStream ───────────────────────────────────────────────────────────────
 
 struct PktQueue {
-    heap:     BinaryHeap<Reverse<PktEntry>>,
+    heap: BinaryHeap<Reverse<PktEntry>>,
     next_seq: u64,
     leftover: BytesMut,
 }
 
 #[derive(Eq, PartialEq)]
-struct PktEntry { seq: u64, data: bytes::Bytes }
+struct PktEntry {
+    seq: u64,
+    data: bytes::Bytes,
+}
 
 impl Ord for PktEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.seq.cmp(&other.seq) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.seq.cmp(&other.seq)
+    }
 }
 impl PartialOrd for PktEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub struct XhttpStream {
-    up_rx:      mpsc::Receiver<UploadPacket>,
-    pkt_queue:  PktQueue,
+    up_rx: mpsc::Receiver<UploadPacket>,
+    pkt_queue: PktQueue,
     stream_buf: BytesMut,
-    eof:        bool,
-    down_tx:    PollSender<bytes::Bytes>,
+    eof: bool,
+    down_tx: PollSender<bytes::Bytes>,
 }
 
 impl XhttpStream {
@@ -548,10 +574,15 @@ impl AsyncRead for XhttpStream {
                     return Poll::Ready(Ok(()));
                 }
             }
-            if this.eof { return Poll::Ready(Ok(())); }
+            if this.eof {
+                return Poll::Ready(Ok(()));
+            }
             match this.up_rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => { this.eof = true; return Poll::Ready(Ok(())); }
+                Poll::Ready(None) => {
+                    this.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Some(pkt)) => match pkt {
                     UploadPacket::Chunk(data) => {
                         let n = data.len().min(buf.remaining());
@@ -564,7 +595,10 @@ impl AsyncRead for XhttpStream {
                     UploadPacket::Packet { seq, data } => {
                         this.pkt_queue.heap.push(Reverse(PktEntry { seq, data }));
                     }
-                    UploadPacket::Eof => { this.eof = true; return Poll::Ready(Ok(())); }
+                    UploadPacket::Eof => {
+                        this.eof = true;
+                        return Poll::Ready(Ok(()));
+                    }
                 },
             }
         }
@@ -580,15 +614,17 @@ impl AsyncWrite for XhttpStream {
         let this = self.get_mut();
         match this.down_tx.poll_reserve(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(_)) => Poll::Ready(Err(
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "xhttp downlink closed")
-            )),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "xhttp downlink closed",
+            ))),
             Poll::Ready(Ok(())) => {
                 match this.down_tx.send_item(bytes::Bytes::copy_from_slice(buf)) {
                     Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(_) => Poll::Ready(Err(
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "xhttp downlink closed")
-                    )),
+                    Err(_) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "xhttp downlink closed",
+                    ))),
                 }
             }
         }
@@ -612,7 +648,7 @@ mod tests {
     #[test]
     fn test_parse_path() {
         let base = "/vless/";
-        assert_eq!(parse_path("/vless", base),  Some((None, None)));
+        assert_eq!(parse_path("/vless", base), Some((None, None)));
         assert_eq!(parse_path("/vless/", base), Some((None, None)));
 
         let sid = "550e8400-e29b-41d4-a716-446655440000";
