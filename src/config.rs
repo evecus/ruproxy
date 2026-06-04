@@ -5,15 +5,13 @@ use uuid::Uuid;
 
 use crate::common::tls::config::StandardTlsConfig;
 
-// ── 兼容层：同一字段既能接受单个 table [xxx] 也能接受数组 [[xxx]] ─────────────
+// ── 兼容层：同一字段既能接受单个 table [x] 也能接受数组 [[x]] ──────────────
 
 fn one_or_many<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    // TOML 里 [[xxx]] 序列化为数组，[xxx] 序列化为单个 table。
-    // 用 serde_json::Value 思路：先尝试 Vec<T>，再尝试 T。
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum OneOrMany<T> {
@@ -42,46 +40,49 @@ pub struct Config {
     pub log: LogConfig,
 
     #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub hysteria2: Vec<Hysteria2Config>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub vless: Vec<VlessConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub tuic: Vec<TuicConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub trojan: Vec<TrojanConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub vmess: Vec<VmessConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub shadowsocks: Vec<ShadowsocksConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub wireguard: Vec<WireGuardConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub anytls: Vec<AnyTlsConfig>,
-
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub socks: Vec<SocksConfig>,
+    pub node: Vec<NodeConfig>,
 }
 
 impl Config {
-    /// 是否一个协议都没配置
     pub fn is_empty(&self) -> bool {
-        self.hysteria2.is_empty()
-            && self.vless.is_empty()
-            && self.tuic.is_empty()
-            && self.trojan.is_empty()
-            && self.vmess.is_empty()
-            && self.shadowsocks.is_empty()
-            && self.wireguard.is_empty()
-            && self.anytls.is_empty()
-            && self.socks.is_empty()
+        self.node.is_empty()
     }
+
+    /// 校验所有 tag 唯一，返回第一个重复的 tag
+    pub fn check_duplicate_tags(&self) -> Option<&str> {
+        let mut seen = std::collections::HashSet::new();
+        for n in &self.node {
+            if !seen.insert(n.tag.as_str()) {
+                return Some(&n.tag);
+            }
+        }
+        None
+    }
+}
+
+// ── Node（顶层统一入口）──────────────────────────────────────────────────────
+
+/// `[[node]]` 块，tag 必填，type 决定协议
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NodeConfig {
+    pub tag: String,
+
+    #[serde(flatten)]
+    pub inner: NodeInner,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum NodeInner {
+    Hysteria2(Hysteria2Config),
+    Vless(VlessConfig),
+    Vmess(VmessConfig),
+    Trojan(TrojanConfig),
+    Shadowsocks(ShadowsocksConfig),
+    Tuic(TuicConfig),
+    Wireguard(WireGuardConfig),
+    Anytls(AnyTlsConfig),
+    Socks(SocksConfig),
 }
 
 // ── SOCKS5 ────────────────────────────────────────────────────────────────────
@@ -95,7 +96,7 @@ pub struct SocksUser {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SocksConfig {
     pub listen: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many_opt")]
     pub users: Vec<SocksUser>,
 }
 
@@ -211,7 +212,6 @@ pub enum VlessTlsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityConfig {
     pub private_key: String,
-    // public_key 仅客户端使用，服务端不需要，不在此配置
     pub short_ids: Vec<String>,
     pub dest: String,
     pub server_name: String,
@@ -306,6 +306,7 @@ pub struct WireGuardConfig {
     pub server_address: Vec<String>,
     #[serde(default = "default_wg_mtu")]
     pub mtu: u16,
+    #[serde(deserialize_with = "one_or_many")]
     pub peers: Vec<WireGuardPeerConfig>,
 }
 
