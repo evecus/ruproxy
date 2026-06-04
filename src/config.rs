@@ -1,9 +1,38 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{collections::HashMap, path::Path, time::Duration};
 use uuid::Uuid;
 
 use crate::common::tls::config::StandardTlsConfig;
+
+// ── 兼容层：同一字段既能接受单个 table [xxx] 也能接受数组 [[xxx]] ─────────────
+
+fn one_or_many<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    // TOML 里 [[xxx]] 序列化为数组，[xxx] 序列化为单个 table。
+    // 用 serde_json::Value 思路：先尝试 Vec<T>，再尝试 T。
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        Many(Vec<T>),
+        One(T),
+    }
+    match OneOrMany::<T>::deserialize(d)? {
+        OneOrMany::Many(v) => Ok(v),
+        OneOrMany::One(t) => Ok(vec![t]),
+    }
+}
+
+fn one_or_many_opt<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    one_or_many(d)
+}
 
 // ── Top-level config ──────────────────────────────────────────────────────────
 
@@ -11,36 +40,61 @@ use crate::common::tls::config::StandardTlsConfig;
 pub struct Config {
     #[serde(default)]
     pub log: LogConfig,
-    pub hysteria2: Option<Hysteria2Config>,
-    pub vless: Option<VlessConfig>,
-    pub tuic: Option<TuicConfig>,
-    pub trojan: Option<TrojanConfig>,
-    pub vmess: Option<VmessConfig>,
-    pub shadowsocks: Option<ShadowsocksConfig>,
-    pub wireguard: Option<WireGuardConfig>,
-    pub anytls: Option<AnyTlsConfig>,
-    pub socks: Option<SocksConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub hysteria2: Vec<Hysteria2Config>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub vless: Vec<VlessConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub tuic: Vec<TuicConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub trojan: Vec<TrojanConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub vmess: Vec<VmessConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub shadowsocks: Vec<ShadowsocksConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub wireguard: Vec<WireGuardConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub anytls: Vec<AnyTlsConfig>,
+
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub socks: Vec<SocksConfig>,
+}
+
+impl Config {
+    /// 是否一个协议都没配置
+    pub fn is_empty(&self) -> bool {
+        self.hysteria2.is_empty()
+            && self.vless.is_empty()
+            && self.tuic.is_empty()
+            && self.trojan.is_empty()
+            && self.vmess.is_empty()
+            && self.shadowsocks.is_empty()
+            && self.wireguard.is_empty()
+            && self.anytls.is_empty()
+            && self.socks.is_empty()
+    }
 }
 
 // ── SOCKS5 ────────────────────────────────────────────────────────────────────
 
-/// A username/password credential pair for SOCKS5 authentication.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SocksUser {
     pub username: String,
     pub password: String,
 }
 
-/// SOCKS5 server configuration.
-///
-/// When `users` is empty the server runs in **no-auth** mode (METHOD 0x00).
-/// When `users` is non-empty only **username/password** auth (RFC 1929) is
-/// accepted; unauthenticated clients are rejected.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SocksConfig {
-    /// TCP listen address, e.g. "0.0.0.0:1080"
     pub listen: String,
-    /// Optional credential list. Leave empty for no-auth mode.
     #[serde(default)]
     pub users: Vec<SocksUser>,
 }
@@ -64,18 +118,10 @@ pub struct TuicConfig {
     pub max_udp_packet_size: usize,
 }
 
-fn default_tuic_idle_time() -> Duration {
-    Duration::from_secs(30)
-}
-fn default_tuic_auth_timeout() -> Duration {
-    Duration::from_secs(3)
-}
-fn default_tuic_udp_timeout() -> Duration {
-    Duration::from_secs(30)
-}
-fn default_tuic_max_udp_packet_size() -> usize {
-    65535
-}
+fn default_tuic_idle_time() -> Duration { Duration::from_secs(30) }
+fn default_tuic_auth_timeout() -> Duration { Duration::from_secs(3) }
+fn default_tuic_udp_timeout() -> Duration { Duration::from_secs(30) }
+fn default_tuic_max_udp_packet_size() -> usize { 65535 }
 
 // ── Hysteria2 ─────────────────────────────────────────────────────────────────
 
@@ -206,25 +252,18 @@ pub struct VmessConfig {
 
 // ── Shadowsocks 2022 ──────────────────────────────────────────────────────────
 
-/// Shadowsocks 2022 cipher methods (AEAD-2022 only).
-/// Password must be a base64-encoded key of the correct length.
-/// Key lengths: aes-128-gcm → 16 bytes, aes-256-gcm → 32 bytes, chacha20 → 32 bytes.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ShadowsocksCipher {
-    /// 2022-blake3-aes-128-gcm  (16-byte key)
     #[serde(rename = "2022-blake3-aes-128-gcm")]
     Blake3Aes128Gcm,
-    /// 2022-blake3-aes-256-gcm  (32-byte key)
     #[serde(rename = "2022-blake3-aes-256-gcm")]
     Blake3Aes256Gcm,
-    /// 2022-blake3-chacha20-poly1305  (32-byte key)
     #[serde(rename = "2022-blake3-chacha20-poly1305")]
     Blake3Chacha20Poly1305,
 }
 
 impl ShadowsocksCipher {
-    /// Key length in bytes.
     pub fn key_len(&self) -> usize {
         match self {
             ShadowsocksCipher::Blake3Aes128Gcm => 16,
@@ -232,50 +271,28 @@ impl ShadowsocksCipher {
             ShadowsocksCipher::Blake3Chacha20Poly1305 => 32,
         }
     }
-    /// Salt length = key length for 2022 ciphers.
-    pub fn salt_len(&self) -> usize {
-        self.key_len()
-    }
-    /// AEAD tag length (always 16).
-    pub fn tag_len(&self) -> usize {
-        16
-    }
+    pub fn salt_len(&self) -> usize { self.key_len() }
+    pub fn tag_len(&self) -> usize { 16 }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShadowsocksConfig {
-    /// TCP listen address, e.g. "0.0.0.0:8388"
     pub listen: String,
-    /// Pre-shared key: base64-encoded bytes matching the cipher key length.
-    /// Generate with: openssl rand -base64 16  (for aes-128)
-    ///                openssl rand -base64 32  (for aes-256 / chacha20)
     pub password: String,
-    /// 2022 cipher method (default: 2022-blake3-aes-256-gcm)
     #[serde(default = "default_ss_cipher")]
     pub method: ShadowsocksCipher,
-    /// Transport layer (tcp / ws / xhttp). Omit for plain TCP.
     #[serde(default)]
     pub transport: TransportConfig,
-    /// Optional TLS.
     pub tls: Option<StandardTlsConfig>,
 }
 
 // ── AnyTLS ────────────────────────────────────────────────────────────────────
 
-/// AnyTLS server configuration.
-///
-/// AnyTLS multiplexes streams over a single TLS connection using a lightweight
-/// session layer with padding obfuscation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnyTlsConfig {
-    /// TCP listen address, e.g. "0.0.0.0:8443"
     pub listen: String,
-    /// Pre-shared password for authentication (sha256 is verified on connection).
     pub password: String,
-    /// TLS configuration (required — AnyTLS is always over TLS).
     pub tls: StandardTlsConfig,
-    /// Optional padding scheme override (server-side).
-    /// If unset, the built-in default scheme is used.
     pub padding_scheme: Option<String>,
 }
 
@@ -303,13 +320,8 @@ pub struct WireGuardPeerConfig {
     pub dns: Vec<String>,
 }
 
-fn default_wg_mtu() -> u16 {
-    1420
-}
-
-fn default_ss_cipher() -> ShadowsocksCipher {
-    ShadowsocksCipher::Blake3Aes256Gcm
-}
+fn default_wg_mtu() -> u16 { 1420 }
+fn default_ss_cipher() -> ShadowsocksCipher { ShadowsocksCipher::Blake3Aes256Gcm }
 
 // ── Shared ────────────────────────────────────────────────────────────────────
 
@@ -321,9 +333,7 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self {
-            level: default_log_level(),
-        }
+        Self { level: default_log_level() }
     }
 }
 
@@ -351,21 +361,11 @@ impl BandwidthConfig {
     }
 }
 
-fn default_log_level() -> String {
-    "info".to_string()
-}
-fn default_masquerade_type() -> String {
-    "none".to_string()
-}
-fn default_transport_type() -> String {
-    "tcp".to_string()
-}
-fn default_ws_path() -> String {
-    "/".to_string()
-}
-fn default_xhttp_path() -> String {
-    "/".to_string()
-}
+fn default_log_level() -> String { "info".to_string() }
+fn default_masquerade_type() -> String { "none".to_string() }
+fn default_transport_type() -> String { "tcp".to_string() }
+fn default_ws_path() -> String { "/".to_string() }
+fn default_xhttp_path() -> String { "/".to_string() }
 
 pub fn load(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(Path::new(path))
