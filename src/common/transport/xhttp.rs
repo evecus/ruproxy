@@ -391,7 +391,9 @@ async fn handle_post(
             });
         }
         Some(s) => {
-            // packet-up
+            // packet-up: collect the body synchronously before returning 200 OK.
+            // If we spawn and return immediately, hyper may process the next pipelined
+            // request before the body is fully read, corrupting HTTP/1.1 framing.
             let seq: u64 = match s.parse() {
                 Ok(n) => n,
                 Err(_) => {
@@ -400,17 +402,15 @@ async fn handle_post(
                 }
             };
             let body = req.into_body();
-            tokio::spawn(async move {
-                match body.collect().await {
-                    Ok(c) => {
-                        let _ = up_tx.send(UploadPacket::Packet {
-                            seq,
-                            data: c.to_bytes(),
-                        }).await;
-                    }
-                    Err(e) => debug!("[xhttp] {peer} packet-up collect: {e}"),
+            match body.collect().await {
+                Ok(c) => {
+                    let _ = up_tx.send(UploadPacket::Packet {
+                        seq,
+                        data: c.to_bytes(),
+                    }).await;
                 }
-            });
+                Err(e) => debug!("[xhttp] {peer} packet-up collect: {e}"),
+            }
         }
     }
 
