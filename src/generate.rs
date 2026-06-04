@@ -74,22 +74,27 @@ pub fn reality_keypair() -> Result<()> {
 
     println!("=== Reality 密钥对 ===");
     println!();
-    println!("# ── 服务端（填入 ruproxy config.toml [vless.tls] / [vmess.tls]）──");
+    println!("# ── 服务端（填入 ruproxy config.toml）──────────────────────────────");
+    println!("# 注意：服务端只需 private_key，public_key 仅客户端使用");
+    println!("[[vless]]");
+    println!("listen = \"0.0.0.0:443\"");
+    println!("uuid   = \"你的UUID\"");
+    println!();
     println!("[vless.tls]");
     println!("type        = \"reality\"");
     println!("private_key = \"{private_b64}\"");
     println!("short_ids   = [\"{short_id}\"]");
-    println!("# server_names 填你想伪装的域名，例如：");
-    println!("# server_names = [\"www.microsoft.com\"]");
+    println!("dest        = \"www.microsoft.com:443\"");
+    println!("server_name = \"www.microsoft.com\"");
     println!();
-    println!("# ── 客户端（Xray / sing-box outbound）──");
+    println!("# ── 客户端（Xray / sing-box）────────────────────────────────────────");
     println!("# public_key = \"{public_b64}\"");
     println!("# short_id   = \"{short_id}\"");
     println!();
-    println!("# ── 原始值（便于复制）──");
-    println!("private_key : {private_b64}");
-    println!("public_key  : {public_b64}");
-    println!("short_id    : {short_id}");
+    println!("# ── 原始值 ──────────────────────────────────────────────────────────");
+    println!("private_key (服务端) : {private_b64}");
+    println!("public_key  (客户端) : {public_b64}");
+    println!("short_id             : {short_id}");
 
     Ok(())
 }

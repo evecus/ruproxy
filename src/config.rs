@@ -211,7 +211,7 @@ pub enum VlessTlsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityConfig {
     pub private_key: String,
-    pub public_key: String,
+    // public_key 仅客户端使用，服务端不需要，不在此配置
     pub short_ids: Vec<String>,
     pub dest: String,
     pub server_name: String,
