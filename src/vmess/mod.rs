@@ -24,8 +24,6 @@ use std::{net::SocketAddr, sync::Arc};
 
 use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes128Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
-use std::pin::Pin;
-use std::task::{Context as TaskContext, Poll};
 use sha2::{Digest, Sha256};
 use sha3::digest::{ExtendableOutput, Update, XofReader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -690,105 +688,4 @@ fn vmess_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     let mut v = uuid.to_vec();
     v.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
     Md5::digest(&v)[..16].try_into().unwrap()
-}
-
-// ── AES-128-CFB stream writer ─────────────────────────────────────────────────
-//
-// Xray DecodeResponseHeader wraps the remaining reader with AES-128-CFB
-// decryption after reading the AEAD response header. Therefore the server must
-// encrypt all response body bytes with AES-128-CFB.
-//
-// CFB-128 mode: feedback register is full block (16 bytes).
-//   iv_0 = IV
-//   keystream_i = AES(key, iv_{i-1})
-//   ciphertext_i = plaintext_i XOR keystream_i[..len(plaintext_i)]
-//   iv_{i+1} uses ciphertext as new register (byte-by-byte, CFB8-style within the block)
-//
-// Matches Go's cipher.NewCFBEncrypter behavior (CFB with 128-bit feedback).
-//
-// CORRECTNESS REQUIREMENT: encrypted bytes must be buffered and flushed atomically.
-// If poll_write returns Pending after encryption, the CFB state has already advanced —
-// we must retry with the *same* ciphertext, not re-encrypt the plaintext.
-// Therefore we keep a `pending` buffer of already-encrypted bytes waiting to be sent.
-
-struct Aes128CfbWriter<W> {
-    inner:    W,
-    cipher:   aes_gcm::aes::Aes128,
-    register: [u8; 16],   // current feedback register
-    keystream: [u8; 16],  // buffered keystream block
-    ks_pos:    usize,     // position in keystream
-    pending:   Vec<u8>,   // encrypted bytes not yet written to inner
-}
-
-impl<W: AsyncWrite + Unpin> Aes128CfbWriter<W> {
-    fn new(inner: W, key: &[u8; 16], iv: &[u8; 16]) -> Self {
-        use aes_gcm::aes::cipher::{BlockEncrypt, KeyInit};
-        let cipher = aes_gcm::aes::Aes128::new_from_slice(key).unwrap();
-        let register = *iv;
-        let mut keystream = register;
-        let block = aes_gcm::aes::Block::from_mut_slice(&mut keystream);
-        cipher.encrypt_block(block);
-        Self { inner, cipher, register, keystream, ks_pos: 0, pending: Vec::new() }
-    }
-
-    fn encrypt_bytes(&mut self, data: &[u8]) -> Vec<u8> {
-        use aes_gcm::aes::cipher::BlockEncrypt;
-        let mut out = Vec::with_capacity(data.len());
-        for &byte in data {
-            if self.ks_pos == 16 {
-                let mut ks = self.register;
-                let block = aes_gcm::aes::Block::from_mut_slice(&mut ks);
-                self.cipher.encrypt_block(block);
-                self.keystream = ks;
-                self.ks_pos = 0;
-            }
-            let ct = byte ^ self.keystream[self.ks_pos];
-            self.register[self.ks_pos] = ct;
-            self.ks_pos += 1;
-            out.push(ct);
-        }
-        out
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for Aes128CfbWriter<W> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-
-        // If there are already-encrypted bytes waiting, flush them first before
-        // accepting new plaintext. This prevents CFB state corruption on retry.
-        if this.pending.is_empty() {
-            // Encrypt now; advance CFB state.
-            this.pending = this.encrypt_bytes(buf);
-        }
-
-        // Try to drain pending. poll_write_all is not available on AsyncWrite,
-        // so we loop until everything is sent or we get Pending/Err.
-        while !this.pending.is_empty() {
-            match Pin::new(&mut this.inner).poll_write(cx, &this.pending) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "cfb inner writer returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => {
-                    this.pending.drain(..n);
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // All encrypted bytes written; report original plaintext length consumed.
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }
