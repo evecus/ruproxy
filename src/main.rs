@@ -28,10 +28,19 @@ async fn main() -> Result<()> {
         match args.get(2).map(|s| s.as_str()) {
             Some("wireguard-keypair") => return generate::wireguard_keypair(),
             Some("reality-keypair")   => return generate::reality_keypair(),
+            Some("uuid")              => return generate::uuid(),
+            Some("password") => {
+                let length: usize = args.get(3)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(16);
+                return generate::password(length);
+            }
             _ => {
                 eprintln!("用法:");
-                eprintln!("  ruproxy generate wireguard-keypair   生成 WireGuard 服务端+客户端密钥对");
-                eprintln!("  ruproxy generate reality-keypair     生成 Reality x25519 密钥对");
+                eprintln!("  ruproxy generate wireguard-keypair        生成 WireGuard 服务端+客户端密钥对");
+                eprintln!("  ruproxy generate reality-keypair          生成 Reality x25519 密钥对");
+                eprintln!("  ruproxy generate uuid                     生成随机 UUID v4");
+                eprintln!("  ruproxy generate password [位数]          生成随机密码（默认16位）");
                 std::process::exit(1);
             }
         }

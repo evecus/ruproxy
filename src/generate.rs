@@ -1,11 +1,39 @@
 //! `ruproxy generate` 子命令：密钥对生成工具。
 //!
 //! 用法：
-//!   ruproxy generate wireguard-keypair   — 生成一套 WireGuard 服务端+客户端密钥
-//!   ruproxy generate reality-keypair     — 生成 Reality x25519 密钥对
+//!   ruproxy generate wireguard-keypair      — 生成一套 WireGuard 服务端+客户端密钥
+//!   ruproxy generate reality-keypair        — 生成 Reality x25519 密钥对
+//!   ruproxy generate uuid                   — 生成随机 UUID v4
+//!   ruproxy generate password [位数]        — 生成随机密码（大小写字母+数字，默认16位）
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+// ── UUID ──────────────────────────────────────────────────────────────────────
+
+/// 生成一个随机 UUID v4。
+pub fn uuid() -> Result<()> {
+    let id = uuid::Uuid::new_v4();
+    println!("{id}");
+    Ok(())
+}
+
+// ── Password ──────────────────────────────────────────────────────────────────
+
+/// 生成随机密码：大小写字母 + 数字，默认 16 位。
+pub fn password(length: usize) -> Result<()> {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    let pwd: String = (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect();
+    println!("{pwd}");
+    Ok(())
+}
 
 // ── WireGuard ─────────────────────────────────────────────────────────────────
 
